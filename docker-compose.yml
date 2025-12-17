@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: logishift_api
+    restart: always
+    environment:
+      - PORT=3000
+      # В Portainer ты переопределишь эти переменные, тут заглушки
+      - DATABASE_URL=postgres://user:pass@postgres_app:5432/db_name
+      - JWT_SECRET=secret
+    networks:
+      - smenabot_net
+    ports:
+      - "3000:3000"
+
+networks:
+  smenabot_net:
+    external: true
+    name: smenabot-net 
+    # ^ Убедись в Portainer -> Networks, что сеть называется именно так. 
+    # Обычно это "имястека_default".
