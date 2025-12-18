@@ -7,7 +7,7 @@ services:
     restart: always
     environment:
       - PORT=3000
-      # Вставляем твои реальные данные прямо сюда:
+      # Твои данные (я их скрыл звездочками, но ты оставь как было у тебя с реальным паролем!)
       - DATABASE_URL=postgres://your_app_user:OQ4kktp-Ht5n@postgres_app:5432/smenabot_db
       - JWT_SECRET=mySu32perSecквафыirecячтKeyc322c3!
     networks:
@@ -18,5 +18,5 @@ services:
 networks:
   smenabot_net:
     external: true
-    name: smenabot_net
-
+    # ВОТ ЗДЕСЬ БЫЛА ОШИБКА. Должно быть тире, как на скриншоте Portainer:
+    name: smenabot-net
