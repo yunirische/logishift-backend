@@ -30,16 +30,29 @@ const authenticateToken = (req: AuthRequest, res: Response, next: NextFunction) 
 
 // --- ROUTES ---
 
-// AUTH
+// AUTH (С ЛОГАМИ!)
 app.post('/api/auth/login', async (req, res) => {
   const { login, password } = req.body;
+  console.log(`[DEBUG] Попытка входа. Логин: '${login}', Пароль: '${password}'`);
+
   try {
     const result = await pool.query('SELECT * FROM public.users WHERE login = $1', [login]);
-    if (result.rows.length === 0) return res.status(401).json({ error: 'User not found' });
+    
+    if (result.rows.length === 0) {
+        console.log(`[DEBUG] ОШИБКА: Пользователь с логином '${login}' не найден в БД.`);
+        // Поможем найти ошибку: выведем всех юзеров, какие есть
+        const allUsers = await pool.query('SELECT login FROM public.users');
+        console.log(`[DEBUG] Доступные логины в базе: ${allUsers.rows.map(u => u.login).join(', ')}`);
+        return res.status(401).json({ error: 'User not found' });
+    }
 
     const user = result.rows[0];
+    console.log(`[DEBUG] Юзер найден (ID: ${user.id}). Сравниваю хеши...`);
+
     const validPassword = await bcrypt.compare(password, user.password_hash);
     
+    console.log(`[DEBUG] Результат проверки пароля: ${validPassword}`);
+
     if (!validPassword) return res.status(401).json({ error: 'Invalid password' });
 
     const token = jwt.sign(
@@ -81,7 +94,6 @@ app.get('/api/trucks', authenticateToken, async (req: AuthRequest, res) => {
     } catch (err) { res.status(500).send('Error'); }
 });
 
-// Добавили: Получение списка объектов
 app.get('/api/sites', authenticateToken, async (req: AuthRequest, res) => {
     try {
         const result = await pool.query('SELECT * FROM dict_sites WHERE tenant_id = $1 AND is_active = true ORDER BY name', [req.user.tenant_id]);
@@ -89,27 +101,20 @@ app.get('/api/sites', authenticateToken, async (req: AuthRequest, res) => {
     } catch (err) { res.status(500).send('Error'); }
 });
 
-// Добавили: Проверка текущей активной смены водителя
 app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res) => {
     try {
-        const result = await pool.query(
-            "SELECT * FROM shifts WHERE user_id = $1 AND status = 'active' LIMIT 1", 
-            [req.user.id]
-        );
-        res.json(result.rows[0] || null); // Возвращаем смену или null
+        const result = await pool.query("SELECT * FROM shifts WHERE user_id = $1 AND status = 'active' LIMIT 1", [req.user.id]);
+        res.json(result.rows[0] || null);
     } catch (err) { res.status(500).send('Error'); }
 });
 
 // WRITE OPERATIONS
-
-// 1. Начать смену
 app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res) => {
     const { truck_id, site_id } = req.body;
     const user_id = req.user.id;
     const tenant_id = req.user.tenant_id;
 
     try {
-        // Проверка: есть ли уже активная смена?
         const activeCheck = await pool.query("SELECT id FROM shifts WHERE user_id = $1 AND status = 'active'", [user_id]);
         if (activeCheck.rows.length > 0) return res.status(400).json({ error: 'У вас уже есть активная смена' });
 
@@ -121,7 +126,6 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res) =
     } catch (err) { console.error(err); res.status(500).send('Error'); }
 });
 
-// 2. Закончить смену
 app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res) => {
     const user_id = req.user.id;
     try {
@@ -129,7 +133,7 @@ app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res) => 
             "UPDATE shifts SET end_time = NOW(), status = 'finished' WHERE user_id = $1 AND status = 'active' RETURNING *",
             [user_id]
         );
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Нет активной смены для завершения' });
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Нет активной смены' });
         res.json(result.rows[0]);
     } catch (err) { console.error(err); res.status(500).send('Error'); }
 });
