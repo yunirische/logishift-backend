@@ -54,8 +54,8 @@ app.post('/api/auth/login', async (req, res) => {
 
     if (!validPassword) {
         // Временный хак: если хеш сложный, а пароль простой, можно раскомментировать строку ниже для генерации нового хеша в консоль
-        // const newHash = await bcrypt.hash(password, 10);
-        // console.log(`[NEW HASH FOR DB] Если пароль верный, обнови хеш в БД на: ${newHash}`);
+        const newHash = await bcrypt.hash(password, 10);
+        console.log(`[NEW HASH FOR DB] Если пароль верный, обнови хеш в БД на: ${newHash}`);
         return res.status(401).json({ error: 'Invalid password' });
     }
 
