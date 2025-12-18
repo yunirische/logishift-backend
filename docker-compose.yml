@@ -18,5 +18,4 @@ services:
 networks:
   smenabot_net:
     external: true
-    name: smenabot_net
-
+    name: smenabot-stack_default
