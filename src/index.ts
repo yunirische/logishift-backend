@@ -30,49 +30,28 @@ const authenticateToken = (req: AuthRequest, res: Response, next: NextFunction) 
 
 // --- ROUTES ---
 
-// 1. LOGIN (С Логами "Шпиона")
+// AUTH
 app.post('/api/auth/login', async (req, res) => {
   const { login, password } = req.body;
-  console.log(`[LOGIN ATTEMPT] Логин: '${login}', Пароль: '${password}'`);
-
   try {
-    // Используем pool.query вместо query
     const result = await pool.query('SELECT * FROM public.users WHERE login = $1', [login]);
-    
-    if (result.rows.length === 0) {
-        console.log('[LOGIN ERROR] Пользователь не найден в базе данных!');
-        return res.status(401).json({ error: 'User not found' });
-    }
+    if (result.rows.length === 0) return res.status(401).json({ error: 'User not found' });
 
     const user = result.rows[0];
-    console.log(`[LOGIN INFO] Нашел пользователя ID: ${user.id}, Хеш в базе: ${user.password_hash}`);
-
-    // Проверка пароля
     const validPassword = await bcrypt.compare(password, user.password_hash);
     
-    console.log(`[LOGIN CHECK] Результат проверки пароля: ${validPassword}`);
-
-    if (!validPassword) {
-        // Временный хак: если хеш сложный, а пароль простой, можно раскомментировать строку ниже для генерации нового хеша в консоль
-        const newHash = await bcrypt.hash(password, 10);
-        console.log(`[NEW HASH FOR DB] Если пароль верный, обнови хеш в БД на: ${newHash}`);
-        return res.status(401).json({ error: 'Invalid password' });
-    }
+    if (!validPassword) return res.status(401).json({ error: 'Invalid password' });
 
     const token = jwt.sign(
       { id: user.id, role: user.role, tenant_id: user.tenant_id },
       JWT_SECRET,
       { expiresIn: '12h' }
     );
-
     res.json({ token, user: { id: user.id, full_name: user.full_name, role: user.role } });
-  } catch (err) {
-    console.error('[LOGIN CRITICAL]', err);
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: 'Server error' }); }
 });
 
-// 2. DASHBOARD STATS
+// READ DATA
 app.get('/api/dashboard/stats', authenticateToken, async (req: AuthRequest, res) => {
   try {
     const tId = req.user.tenant_id;
@@ -82,13 +61,77 @@ app.get('/api/dashboard/stats', authenticateToken, async (req: AuthRequest, res)
   } catch (err) { res.status(500).send('Error'); }
 });
 
-// 3. GET SHIFTS
 app.get('/api/shifts', authenticateToken, async (req: AuthRequest, res) => {
   try {
-    const sql = `SELECT s.*, u.full_name as driver_name FROM shifts s LEFT JOIN users u ON s.user_id = u.id WHERE s.tenant_id = $1 ORDER BY s.created_at DESC LIMIT 50`;
+    const sql = `SELECT s.*, u.full_name as driver_name, t.name as truck_name, st.name as site_name 
+                 FROM shifts s 
+                 LEFT JOIN users u ON s.user_id = u.id 
+                 LEFT JOIN dict_trucks t ON s.truck_id = t.id
+                 LEFT JOIN dict_sites st ON s.site_id = st.id
+                 WHERE s.tenant_id = $1 ORDER BY s.created_at DESC LIMIT 50`;
     const result = await pool.query(sql, [req.user.tenant_id]);
     res.json(result.rows);
   } catch (err) { res.status(500).send('Error'); }
+});
+
+app.get('/api/trucks', authenticateToken, async (req: AuthRequest, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM dict_trucks WHERE tenant_id = $1 AND is_active = true ORDER BY name', [req.user.tenant_id]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).send('Error'); }
+});
+
+// Добавили: Получение списка объектов
+app.get('/api/sites', authenticateToken, async (req: AuthRequest, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM dict_sites WHERE tenant_id = $1 AND is_active = true ORDER BY name', [req.user.tenant_id]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).send('Error'); }
+});
+
+// Добавили: Проверка текущей активной смены водителя
+app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT * FROM shifts WHERE user_id = $1 AND status = 'active' LIMIT 1", 
+            [req.user.id]
+        );
+        res.json(result.rows[0] || null); // Возвращаем смену или null
+    } catch (err) { res.status(500).send('Error'); }
+});
+
+// WRITE OPERATIONS
+
+// 1. Начать смену
+app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res) => {
+    const { truck_id, site_id } = req.body;
+    const user_id = req.user.id;
+    const tenant_id = req.user.tenant_id;
+
+    try {
+        // Проверка: есть ли уже активная смена?
+        const activeCheck = await pool.query("SELECT id FROM shifts WHERE user_id = $1 AND status = 'active'", [user_id]);
+        if (activeCheck.rows.length > 0) return res.status(400).json({ error: 'У вас уже есть активная смена' });
+
+        const result = await pool.query(
+            "INSERT INTO shifts (user_id, tenant_id, truck_id, site_id, start_time, status) VALUES ($1, $2, $3, $4, NOW(), 'active') RETURNING *",
+            [user_id, tenant_id, truck_id, site_id]
+        );
+        res.json(result.rows[0]);
+    } catch (err) { console.error(err); res.status(500).send('Error'); }
+});
+
+// 2. Закончить смену
+app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res) => {
+    const user_id = req.user.id;
+    try {
+        const result = await pool.query(
+            "UPDATE shifts SET end_time = NOW(), status = 'finished' WHERE user_id = $1 AND status = 'active' RETURNING *",
+            [user_id]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Нет активной смены для завершения' });
+        res.json(result.rows[0]);
+    } catch (err) { console.error(err); res.status(500).send('Error'); }
 });
 
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
