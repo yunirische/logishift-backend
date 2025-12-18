@@ -32,19 +32,42 @@ const authenticateToken = (req: AuthRequest, res: Response, next: NextFunction) 
 // --- ROUTES ---
 
 // 1. LOGIN
+// POST /api/auth/login
 app.post('/api/auth/login', async (req, res) => {
   const { login, password } = req.body;
+  console.log(`[LOGIN ATTEMPT] Логин: '${login}', Пароль: '${password}'`);
+
   try {
-    const result = await pool.query('SELECT * FROM public.users WHERE login = $1', [login]);
-    if (result.rows.length === 0) return res.status(401).json({ error: 'User not found' });
+    // 1. Ищем пользователя
+    const result = await query('SELECT * FROM public.users WHERE login = $1', [login]);
     
+    if (result.rows.length === 0) {
+        console.log('[LOGIN ERROR] Пользователь не найден в базе данных!');
+        return res.status(401).json({ error: 'User not found' });
+    }
+
     const user = result.rows[0];
+    console.log(`[LOGIN INFO] Нашел пользователя ID: ${user.id}, Хеш в базе: ${user.password_hash}`);
+
+    // 2. Проверяем пароль (сравниваем хеш)
     const validPassword = await bcrypt.compare(password, user.password_hash);
+    
+    console.log(`[LOGIN CHECK] Результат проверки пароля: ${validPassword}`);
+
     if (!validPassword) return res.status(401).json({ error: 'Invalid password' });
 
-    const token = jwt.sign({ id: user.id, role: user.role, tenant_id: user.tenant_id }, JWT_SECRET, { expiresIn: '12h' });
+    // 3. Генерируем токен
+    const token = jwt.sign(
+      { id: user.id, role: user.role, tenant_id: user.tenant_id },
+      JWT_SECRET,
+      { expiresIn: '12h' }
+    );
+
     res.json({ token, user: { id: user.id, full_name: user.full_name, role: user.role } });
-  } catch (err) { console.error(err); res.status(500).json({ error: 'Server error' }); }
+  } catch (err) {
+    console.error('[LOGIN CRITICAL]', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
 });
 
 // 2. DASHBOARD STATS
