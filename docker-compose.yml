@@ -7,9 +7,9 @@ services:
     restart: always
     environment:
       - PORT=3000
-      # В Portainer ты переопределишь эти переменные, тут заглушки
-      - DATABASE_URL=postgres://user:pass@postgres_app:5432/db_name
-      - JWT_SECRET=secret
+      # Вставляем твои реальные данные прямо сюда:
+      - DATABASE_URL=postgres://your_app_user:OQ4kktp-Ht5n@postgres_app:5432/smenabot_db
+      - JWT_SECRET=mySu32perSecквафыirecячтKeyc322c3!
     networks:
       - smenabot_net
     ports:
@@ -18,6 +18,4 @@ services:
 networks:
   smenabot_net:
     external: true
-    name: smenabot-net 
-    # ^ Убедись в Portainer -> Networks, что сеть называется именно так. 
-    # Обычно это "имястека_default".
+    name: smenabot-stack_default
