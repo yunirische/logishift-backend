@@ -1,4 +1,3 @@
-// src/index.ts
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { Pool } from 'pg';
@@ -31,15 +30,14 @@ const authenticateToken = (req: AuthRequest, res: Response, next: NextFunction) 
 
 // --- ROUTES ---
 
-// 1. LOGIN
-// POST /api/auth/login
+// 1. LOGIN (С Логами "Шпиона")
 app.post('/api/auth/login', async (req, res) => {
   const { login, password } = req.body;
   console.log(`[LOGIN ATTEMPT] Логин: '${login}', Пароль: '${password}'`);
 
   try {
-    // 1. Ищем пользователя
-    const result = await query('SELECT * FROM public.users WHERE login = $1', [login]);
+    // Используем pool.query вместо query
+    const result = await pool.query('SELECT * FROM public.users WHERE login = $1', [login]);
     
     if (result.rows.length === 0) {
         console.log('[LOGIN ERROR] Пользователь не найден в базе данных!');
@@ -49,14 +47,18 @@ app.post('/api/auth/login', async (req, res) => {
     const user = result.rows[0];
     console.log(`[LOGIN INFO] Нашел пользователя ID: ${user.id}, Хеш в базе: ${user.password_hash}`);
 
-    // 2. Проверяем пароль (сравниваем хеш)
+    // Проверка пароля
     const validPassword = await bcrypt.compare(password, user.password_hash);
     
     console.log(`[LOGIN CHECK] Результат проверки пароля: ${validPassword}`);
 
-    if (!validPassword) return res.status(401).json({ error: 'Invalid password' });
+    if (!validPassword) {
+        // Временный хак: если хеш сложный, а пароль простой, можно раскомментировать строку ниже для генерации нового хеша в консоль
+        // const newHash = await bcrypt.hash(password, 10);
+        // console.log(`[NEW HASH FOR DB] Если пароль верный, обнови хеш в БД на: ${newHash}`);
+        return res.status(401).json({ error: 'Invalid password' });
+    }
 
-    // 3. Генерируем токен
     const token = jwt.sign(
       { id: user.id, role: user.role, tenant_id: user.tenant_id },
       JWT_SECRET,
@@ -88,8 +90,5 @@ app.get('/api/shifts', authenticateToken, async (req: AuthRequest, res) => {
     res.json(result.rows);
   } catch (err) { res.status(500).send('Error'); }
 });
-
-// Health check
-app.get('/', (req, res) => res.send('LogiShift API is running'));
 
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
