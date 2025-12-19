@@ -170,4 +170,32 @@ app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res) => 
     } catch (err) { console.error(err); res.status(500).send('Error'); }
 });
 
+// CREATE USER (Только для Админа или Системы)
+app.post('/api/users', authenticateToken, async (req: AuthRequest, res) => {
+    // Простая проверка прав: создавать может только админ (или n8n)
+    if (req.user.role !== 'admin' && req.user.role !== 'system') {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { full_name, login, password, role } = req.body;
+    const tenant_id = req.user.tenant_id;
+
+    if (!login || !password) return res.status(400).json({ error: 'Login and password required' });
+
+    try {
+        // ВОТ ОНО: Сервер сам генерирует правильный хеш
+        const hash = await bcrypt.hash(password, 10);
+        
+        const result = await pool.query(
+            "INSERT INTO users (full_name, login, password_hash, role, tenant_id, is_active) VALUES ($1, $2, $3, $4, $5, true) RETURNING id, full_name, login, role",
+            [full_name, login, hash, role || 'driver', tenant_id]
+        );
+        res.json(result.rows[0]);
+    } catch (err: any) {
+        if (err.code === '23505') return res.status(400).json({ error: 'Login already exists' }); // Ошибка уникальности
+        console.error(err); 
+        res.status(500).send('Error'); 
+    }
+});
+
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
