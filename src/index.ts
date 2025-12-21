@@ -5,9 +5,9 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
-import crypto from 'crypto'; // Добавили для генерации API Key
+import * as path from 'path'; // Исправлен импорт
+import * as fs from 'fs';     // Исправлен импорт
+import * as crypto from 'crypto'; // Исправлен импорт для совместимости
 
 dotenv.config();
 
@@ -40,7 +40,10 @@ app.use(cors());
 app.use(express.json());
 
 // --- MIDDLEWARE ---
-interface AuthRequest extends Request { user?: any; }
+// Расширяем интерфейс Request, чтобы TS не ругался на user
+interface AuthRequest extends Request {
+    user?: any;
+}
 
 const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunction) => {
   const apiKey = req.headers['x-api-key'] as string;
@@ -71,14 +74,15 @@ const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunc
 // --- ROUTES ---
 
 // 1. UPLOAD FILE
-app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
+// Используем any для req, чтобы TS не ругался на req.file
+app.post('/api/upload', authenticateToken, upload.single('file'), (req: any, res: Response) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const fileUrl = `/uploads/${req.file.filename}`;
     res.json({ url: fileUrl });
 });
 
 // 2. AUTH & USERS
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', async (req: Request, res: Response) => {
   const { login, password } = req.body;
   try {
     const result = await pool.query('SELECT * FROM public.users WHERE login = $1', [login]);
@@ -94,7 +98,7 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: 'Server error' }); }
 });
 
-app.post('/api/users', authenticateToken, async (req: AuthRequest, res) => {
+app.post('/api/users', authenticateToken, async (req: AuthRequest, res: Response) => {
     if (req.user.role !== 'admin' && req.user.role !== 'system') return res.status(403).json({ error: 'Access denied' });
     const { full_name, login, password, role } = req.body;
     try {
@@ -108,7 +112,7 @@ app.post('/api/users', authenticateToken, async (req: AuthRequest, res) => {
 });
 
 // 3. READ DATA
-app.get('/api/dashboard/stats', authenticateToken, async (req: AuthRequest, res) => {
+app.get('/api/dashboard/stats', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
         const tId = req.user.tenant_id;
         const shifts = await pool.query("SELECT COUNT(*) FROM shifts WHERE tenant_id = $1 AND status = 'active'", [tId]);
@@ -117,7 +121,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req: AuthRequest, res)
     } catch (err) { res.status(500).send('Error'); }
 });
 
-app.get('/api/shifts', authenticateToken, async (req: AuthRequest, res) => {
+app.get('/api/shifts', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
         const sql = `SELECT s.*, u.full_name as driver_name, t.name as truck_name, st.name as site_name FROM shifts s LEFT JOIN users u ON s.user_id = u.id LEFT JOIN dict_trucks t ON s.truck_id = t.id LEFT JOIN dict_sites st ON s.site_id = st.id WHERE s.tenant_id = $1 ORDER BY s.created_at DESC LIMIT 50`;
         const result = await pool.query(sql, [req.user.tenant_id]);
@@ -126,10 +130,10 @@ app.get('/api/shifts', authenticateToken, async (req: AuthRequest, res) => {
 });
 
 // 4. DICTIONARIES CRUD
-app.get('/api/trucks', authenticateToken, async (req: AuthRequest, res) => {
+app.get('/api/trucks', authenticateToken, async (req: AuthRequest, res: Response) => {
     try { const result = await pool.query('SELECT * FROM dict_trucks WHERE tenant_id = $1 AND is_active = true ORDER BY name', [req.user.tenant_id]); res.json(result.rows); } catch (err) { res.status(500).send('Error'); }
 });
-app.post('/api/trucks', authenticateToken, async (req: AuthRequest, res) => {
+app.post('/api/trucks', authenticateToken, async (req: AuthRequest, res: Response) => {
     if (req.user.role !== 'admin' && req.user.role !== 'system') return res.status(403).send('Denied');
     const { name, plate, code } = req.body;
     try {
@@ -138,10 +142,10 @@ app.post('/api/trucks', authenticateToken, async (req: AuthRequest, res) => {
     } catch (e) { res.status(500).send('Error'); }
 });
 
-app.get('/api/sites', authenticateToken, async (req: AuthRequest, res) => {
+app.get('/api/sites', authenticateToken, async (req: AuthRequest, res: Response) => {
     try { const result = await pool.query('SELECT * FROM dict_sites WHERE tenant_id = $1 AND is_active = true ORDER BY name', [req.user.tenant_id]); res.json(result.rows); } catch (err) { res.status(500).send('Error'); }
 });
-app.post('/api/sites', authenticateToken, async (req: AuthRequest, res) => {
+app.post('/api/sites', authenticateToken, async (req: AuthRequest, res: Response) => {
     if (req.user.role !== 'admin' && req.user.role !== 'system') return res.status(403).send('Denied');
     const { name, address, code } = req.body;
     try {
@@ -150,13 +154,14 @@ app.post('/api/sites', authenticateToken, async (req: AuthRequest, res) => {
     } catch (e) { res.status(500).send('Error'); }
 });
 
-// 5. SHIFT LOGIC (С Фото и Гео!)
-app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res) => {
+// 5. SHIFT LOGIC
+app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: Response) => {
+    // Приведение типов для query параметров
     const targetUserId = req.user.role === 'system' ? req.query.user_id : req.user.id;
     try { const result = await pool.query("SELECT * FROM shifts WHERE user_id = $1 AND status = 'active' LIMIT 1", [targetUserId]); res.json(result.rows[0] || null); } catch (err) { res.status(500).send('Error'); }
 });
 
-app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res) => {
+app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: Response) => {
     const { truck_id, site_id, geo, photo_url, mileage } = req.body;
     let user_id = req.user.id;
     if (req.user.role === 'system') user_id = req.body.user_id;
@@ -180,7 +185,7 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res) =
     }
 });
 
-app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res) => {
+app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res: Response) => {
     const { geo, photo_url, mileage, comments } = req.body;
     let user_id = req.user.id;
     if (req.user.role === 'system') user_id = req.body.user_id;
@@ -202,7 +207,7 @@ app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res) => 
 // ==========================================
 // 6. ONBOARDING (TELEGRAM / N8N WEBHOOK)
 // ==========================================
-app.post('/api/integrations/telegram/webhook', async (req, res) => {
+app.post('/api/integrations/telegram/webhook', async (req: Request, res: Response) => {
     const { id: tgId, username, first_name, last_name, text } = req.body;
 
     if (!tgId) return res.status(400).json({ error: 'Missing Telegram User ID' });
@@ -214,6 +219,7 @@ app.post('/api/integrations/telegram/webhook', async (req, res) => {
 
     try {
         // 1. ПРОВЕРКА: Существует ли юзер?
+        // Используем приведение типа для tgId, если он приходит как число
         const userCheck = await client.query('SELECT * FROM users WHERE telegram_user_id = $1', [tgId]);
         
         if (userCheck.rows.length > 0) {
@@ -226,7 +232,6 @@ app.post('/api/integrations/telegram/webhook', async (req, res) => {
             });
         }
 
-        // Если юзера нет, парсим текст
         const inviteMatch = text ? text.match(/^\/start\s+(.+)$/) : null;
         const inviteCode = inviteMatch ? inviteMatch[1] : null;
 
@@ -310,4 +315,36 @@ app.post('/api/integrations/telegram/webhook', async (req, res) => {
             // Демо-данные
             await client.query(
                 `INSERT INTO dict_trucks (tenant_id, code, name, plate, is_active, is_busy)
-                 VALUES ($1, 'AUTO-01', 'Тестовый Грузовик', 'A777AA
+                 VALUES ($1, 'AUTO-01', 'Тестовый Грузовик', 'A777AA 77', true, false)`,
+                [tenantId]
+            );
+
+            await client.query(
+                `INSERT INTO dict_sites (tenant_id, code, name, address, is_active)
+                 VALUES ($1, 'BASE-01', 'Главный Склад', 'г. Москва, Центр', true)`,
+                [tenantId]
+            );
+
+            await client.query('COMMIT');
+
+            return res.json({
+                status: 'created_tenant',
+                message: 'Компания создана! Вы администратор.',
+                user: adminUser.rows[0],
+                api_key: apiKey
+            });
+
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        }
+
+    } catch (error) {
+        console.error('Onboarding Error:', error);
+        res.status(500).json({ error: 'Server error processing webhook' });
+    } finally {
+        client.release();
+    }
+});
+
+app.listen(PORT, () => console.log(`Server on ${PORT}`));
