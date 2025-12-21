@@ -7,7 +7,7 @@ import dotenv from 'dotenv';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
-import crypto from 'crypto';
+import crypto from 'crypto'; // Добавили для генерации API Key
 
 dotenv.config();
 
@@ -15,7 +15,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'secret';
-const UPLOAD_DIR = process.env.UPLOAD_DIR || '/app/uploads'; // Папка из docker-compose
+const UPLOAD_DIR = process.env.UPLOAD_DIR || '/app/uploads';
 
 // Подключение к БД
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -30,7 +30,6 @@ const storage = multer.diskStorage({
         cb(null, UPLOAD_DIR);
     },
     filename: (req, file, cb) => {
-        // Генерируем уникальное имя: timestamp-random.ext
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
         cb(null, uniqueSuffix + path.extname(file.originalname));
     }
@@ -45,16 +44,20 @@ interface AuthRequest extends Request { user?: any; }
 
 const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunction) => {
   const apiKey = req.headers['x-api-key'] as string;
+  
+  // 1. Проверка API Key (для n8n)
   if (apiKey) {
     try {
       const result = await pool.query('SELECT id FROM tenants WHERE api_key = $1', [apiKey]);
       if (result.rows.length > 0) {
+        // Если ключ верный, даем права "system"
         req.user = { id: 0, role: 'system', tenant_id: result.rows[0].id };
         return next();
       }
     } catch (e) { console.error(e); }
   }
 
+  // 2. Проверка Bearer Token (для фронтенда)
   const token = req.headers['authorization']?.split(' ')[1];
   if (!token) return res.sendStatus(401);
 
@@ -67,13 +70,9 @@ const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunc
 
 // --- ROUTES ---
 
-// 1. UPLOAD FILE (Новое!)
-// Принимает файл в поле 'file'. Возвращает URL.
+// 1. UPLOAD FILE
 app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    
-    // Возвращаем путь, по которому Caddy отдаст файл
-    // Например: /uploads/17000000-123.jpg
     const fileUrl = `/uploads/${req.file.filename}`;
     res.json({ url: fileUrl });
 });
@@ -126,14 +125,12 @@ app.get('/api/shifts', authenticateToken, async (req: AuthRequest, res) => {
     } catch (err) { res.status(500).send('Error'); }
 });
 
-// 4. DICTIONARIES CRUD (Машины и Объекты)
-
-// Trucks
+// 4. DICTIONARIES CRUD
 app.get('/api/trucks', authenticateToken, async (req: AuthRequest, res) => {
     try { const result = await pool.query('SELECT * FROM dict_trucks WHERE tenant_id = $1 AND is_active = true ORDER BY name', [req.user.tenant_id]); res.json(result.rows); } catch (err) { res.status(500).send('Error'); }
 });
 app.post('/api/trucks', authenticateToken, async (req: AuthRequest, res) => {
-    if (req.user.role !== 'admin') return res.status(403).send('Denied');
+    if (req.user.role !== 'admin' && req.user.role !== 'system') return res.status(403).send('Denied');
     const { name, plate, code } = req.body;
     try {
         const result = await pool.query("INSERT INTO dict_trucks (tenant_id, name, plate, code, is_active) VALUES ($1, $2, $3, $4, true) RETURNING *", [req.user.tenant_id, name, plate, code]);
@@ -141,12 +138,11 @@ app.post('/api/trucks', authenticateToken, async (req: AuthRequest, res) => {
     } catch (e) { res.status(500).send('Error'); }
 });
 
-// Sites
 app.get('/api/sites', authenticateToken, async (req: AuthRequest, res) => {
     try { const result = await pool.query('SELECT * FROM dict_sites WHERE tenant_id = $1 AND is_active = true ORDER BY name', [req.user.tenant_id]); res.json(result.rows); } catch (err) { res.status(500).send('Error'); }
 });
 app.post('/api/sites', authenticateToken, async (req: AuthRequest, res) => {
-    if (req.user.role !== 'admin') return res.status(403).send('Denied');
+    if (req.user.role !== 'admin' && req.user.role !== 'system') return res.status(403).send('Denied');
     const { name, address, code } = req.body;
     try {
         const result = await pool.query("INSERT INTO dict_sites (tenant_id, name, address, code, is_active) VALUES ($1, $2, $3, $4, true) RETURNING *", [req.user.tenant_id, name, address, code]);
@@ -154,24 +150,19 @@ app.post('/api/sites', authenticateToken, async (req: AuthRequest, res) => {
     } catch (e) { res.status(500).send('Error'); }
 });
 
-
 // 5. SHIFT LOGIC (С Фото и Гео!)
-
 app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res) => {
     const targetUserId = req.user.role === 'system' ? req.query.user_id : req.user.id;
     try { const result = await pool.query("SELECT * FROM shifts WHERE user_id = $1 AND status = 'active' LIMIT 1", [targetUserId]); res.json(result.rows[0] || null); } catch (err) { res.status(500).send('Error'); }
 });
 
 app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res) => {
-    // Принимаем новые поля: geo (json), photo_url (string), mileage (int)
     const { truck_id, site_id, geo, photo_url, mileage } = req.body;
-    
     let user_id = req.user.id;
     if (req.user.role === 'system') user_id = req.body.user_id;
     const tenant_id = req.user.tenant_id;
 
     try {
-        // Триггер в БД сам проверит занятость, но можно оставить и тут
         const result = await pool.query(
             `INSERT INTO shifts 
             (user_id, tenant_id, truck_id, site_id, start_time, status, geo_start, photo_start_url, mileage_start) 
@@ -182,7 +173,6 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res) =
         res.json(result.rows[0]);
     } catch (err: any) { 
         console.error(err); 
-        // Если сработал наш SQL-триггер уникальности
         if (err.message && err.message.includes('Active shift already exists')) {
             return res.status(400).json({ error: 'У вас уже есть активная смена' });
         }
@@ -191,9 +181,7 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res) =
 });
 
 app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res) => {
-    // Принимаем новые поля для финиша
     const { geo, photo_url, mileage, comments } = req.body;
-    
     let user_id = req.user.id;
     if (req.user.role === 'system') user_id = req.body.user_id;
 
@@ -214,18 +202,15 @@ app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res) => 
 // ==========================================
 // 6. ONBOARDING (TELEGRAM / N8N WEBHOOK)
 // ==========================================
-
 app.post('/api/integrations/telegram/webhook', async (req, res) => {
-    // Ожидаем данные от n8n: { id, username, first_name, last_name, text }
     const { id: tgId, username, first_name, last_name, text } = req.body;
 
     if (!tgId) return res.status(400).json({ error: 'Missing Telegram User ID' });
 
     const fullName = [first_name, last_name].filter(Boolean).join(' ') || username || 'Unknown';
-    // Если юзернейма нет, генерируем фейковый, чтобы база не ругалась на unique constraint
     const login = username || `tg_${tgId}`; 
 
-    const client = await pool.connect(); // Берем клиента для транзакций
+    const client = await pool.connect();
 
     try {
         // 1. ПРОВЕРКА: Существует ли юзер?
@@ -241,8 +226,7 @@ app.post('/api/integrations/telegram/webhook', async (req, res) => {
             });
         }
 
-        // Если юзера нет, смотрим текст сообщения
-        // Ищем код вида "/start code_123"
+        // Если юзера нет, парсим текст
         const inviteMatch = text ? text.match(/^\/start\s+(.+)$/) : null;
         const inviteCode = inviteMatch ? inviteMatch[1] : null;
 
@@ -251,7 +235,6 @@ app.post('/api/integrations/telegram/webhook', async (req, res) => {
             try {
                 await client.query('BEGIN');
 
-                // Проверяем инвайт (блокируем строку от повторного использования)
                 const inviteRes = await client.query(
                     `SELECT * FROM invites WHERE code = $1 AND status = 'pending' AND expires_at > NOW() FOR UPDATE`,
                     [inviteCode]
@@ -263,9 +246,8 @@ app.post('/api/integrations/telegram/webhook', async (req, res) => {
                 }
 
                 const invite = inviteRes.rows[0];
-                const defaultPass = await bcrypt.hash('123456', 10); // Временный пароль
+                const defaultPass = await bcrypt.hash('123456', 10);
 
-                // Создаем водителя
                 const newUser = await client.query(
                     `INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active)
                      VALUES ($1, $2, 'driver', $3, $4, $5, true)
@@ -273,7 +255,6 @@ app.post('/api/integrations/telegram/webhook', async (req, res) => {
                     [tgId, fullName, invite.tenant_id, login, defaultPass]
                 );
 
-                // Помечаем инвайт как использованный
                 await client.query(`UPDATE invites SET status = 'used' WHERE id = $1`, [invite.id]);
 
                 await client.query('COMMIT');
@@ -291,31 +272,27 @@ app.post('/api/integrations/telegram/webhook', async (req, res) => {
         }
 
         // 3. СЦЕНАРИЙ: НОВАЯ КОМПАНИЯ (АДМИН)
-        // Если кода нет, создаем новый Тенант + Админа + Демо данные
         try {
             await client.query('BEGIN');
 
-            // Ищем любой план подписки (или дефолтный)
             let planRes = await client.query(`SELECT id FROM plans LIMIT 1`);
             if (planRes.rows.length === 0) {
-                 // Если планов нет вообще, создаем технический план на лету (чтобы код не упал)
                  planRes = await client.query(`INSERT INTO plans (code, name, price_monthly) VALUES ('demo', 'Demo Plan', 0) RETURNING id`);
             }
             const planId = planRes.rows[0].id;
 
-            // Генерируем API Key
             const apiKey = crypto.randomBytes(32).toString('hex');
 
-            // Создаем Тенант
+            // ШАГ 1: Создаем Тенанта БЕЗ владельца
             const tenantRes = await client.query(
                 `INSERT INTO tenants (name, plan_id, is_active, api_key, owner_user_id)
-                 VALUES ($1, $2, true, $3, $4)
+                 VALUES ($1, $2, true, $3, NULL)
                  RETURNING id`,
-                [`Компания ${fullName}`, planId, apiKey, tgId]
+                [`Компания ${fullName}`, planId, apiKey]
             );
             const tenantId = tenantRes.rows[0].id;
 
-            // Создаем Админа
+            // ШАГ 2: Создаем Админа
             const defaultPass = await bcrypt.hash('admin123', 10);
             const adminUser = await client.query(
                 `INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active)
@@ -324,40 +301,13 @@ app.post('/api/integrations/telegram/webhook', async (req, res) => {
                 [tgId, fullName, tenantId, login, defaultPass]
             );
 
-            // Демо-данные: Машина
+            // ШАГ 3: Привязываем владельца
+            await client.query(
+                `UPDATE tenants SET owner_user_id = $1 WHERE id = $2`,
+                [tgId, tenantId]
+            );
+
+            // Демо-данные
             await client.query(
                 `INSERT INTO dict_trucks (tenant_id, code, name, plate, is_active, is_busy)
-                 VALUES ($1, 'AUTO-01', 'Тестовый Грузовик', 'A777AA 77', true, false)`,
-                [tenantId]
-            );
-
-            // Демо-данные: Объект
-            await client.query(
-                `INSERT INTO dict_sites (tenant_id, code, name, address, is_active)
-                 VALUES ($1, 'BASE-01', 'Главный Склад', 'г. Москва, Центр', true)`,
-                [tenantId]
-            );
-
-            await client.query('COMMIT');
-
-            return res.json({
-                status: 'created_tenant',
-                message: 'Компания создана! Вы администратор.',
-                user: adminUser.rows[0],
-                api_key: apiKey // Отдаем ключ, чтобы n8n мог его сохранить
-            });
-
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        }
-
-    } catch (error) {
-        console.error('Onboarding Error:', error);
-        res.status(500).json({ error: 'Server error processing webhook' });
-    } finally {
-        client.release(); // Обязательно возвращаем клиента в пул
-    }
-});
-
-app.listen(PORT, () => console.log(`Server on ${PORT}`));
+                 VALUES ($1, 'AUTO-01', 'Тестовый Грузовик', 'A777AA
