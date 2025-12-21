@@ -7,6 +7,7 @@ import dotenv from 'dotenv';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -208,6 +209,155 @@ app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res) => 
         if (result.rows.length === 0) return res.status(404).json({ error: 'Нет активной смены' });
         res.json(result.rows[0]);
     } catch (err) { console.error(err); res.status(500).send('Error'); }
+});
+
+// ==========================================
+// 6. ONBOARDING (TELEGRAM / N8N WEBHOOK)
+// ==========================================
+
+app.post('/api/integrations/telegram/webhook', async (req, res) => {
+    // Ожидаем данные от n8n: { id, username, first_name, last_name, text }
+    const { id: tgId, username, first_name, last_name, text } = req.body;
+
+    if (!tgId) return res.status(400).json({ error: 'Missing Telegram User ID' });
+
+    const fullName = [first_name, last_name].filter(Boolean).join(' ') || username || 'Unknown';
+    // Если юзернейма нет, генерируем фейковый, чтобы база не ругалась на unique constraint
+    const login = username || `tg_${tgId}`; 
+
+    const client = await pool.connect(); // Берем клиента для транзакций
+
+    try {
+        // 1. ПРОВЕРКА: Существует ли юзер?
+        const userCheck = await client.query('SELECT * FROM users WHERE telegram_user_id = $1', [tgId]);
+        
+        if (userCheck.rows.length > 0) {
+            const user = userCheck.rows[0];
+            return res.json({
+                status: 'active_user',
+                message: `С возвращением, ${user.full_name}!`,
+                role: user.role,
+                user: user
+            });
+        }
+
+        // Если юзера нет, смотрим текст сообщения
+        // Ищем код вида "/start code_123"
+        const inviteMatch = text ? text.match(/^\/start\s+(.+)$/) : null;
+        const inviteCode = inviteMatch ? inviteMatch[1] : null;
+
+        // 2. СЦЕНАРИЙ: РЕГИСТРАЦИЯ ВОДИТЕЛЯ ПО КОДУ
+        if (inviteCode) {
+            try {
+                await client.query('BEGIN');
+
+                // Проверяем инвайт (блокируем строку от повторного использования)
+                const inviteRes = await client.query(
+                    `SELECT * FROM invites WHERE code = $1 AND status = 'pending' AND expires_at > NOW() FOR UPDATE`,
+                    [inviteCode]
+                );
+
+                if (inviteRes.rows.length === 0) {
+                    await client.query('ROLLBACK');
+                    return res.json({ status: 'error', message: 'Код неверный или истек.' });
+                }
+
+                const invite = inviteRes.rows[0];
+                const defaultPass = await bcrypt.hash('123456', 10); // Временный пароль
+
+                // Создаем водителя
+                const newUser = await client.query(
+                    `INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active)
+                     VALUES ($1, $2, 'driver', $3, $4, $5, true)
+                     RETURNING id, full_name, role`,
+                    [tgId, fullName, invite.tenant_id, login, defaultPass]
+                );
+
+                // Помечаем инвайт как использованный
+                await client.query(`UPDATE invites SET status = 'used' WHERE id = $1`, [invite.id]);
+
+                await client.query('COMMIT');
+
+                return res.json({
+                    status: 'registered_driver',
+                    message: 'Вы успешно зарегистрированы как водитель.',
+                    user: newUser.rows[0]
+                });
+
+            } catch (err) {
+                await client.query('ROLLBACK');
+                throw err;
+            }
+        }
+
+        // 3. СЦЕНАРИЙ: НОВАЯ КОМПАНИЯ (АДМИН)
+        // Если кода нет, создаем новый Тенант + Админа + Демо данные
+        try {
+            await client.query('BEGIN');
+
+            // Ищем любой план подписки (или дефолтный)
+            let planRes = await client.query(`SELECT id FROM plans LIMIT 1`);
+            if (planRes.rows.length === 0) {
+                 // Если планов нет вообще, создаем технический план на лету (чтобы код не упал)
+                 planRes = await client.query(`INSERT INTO plans (code, name, price_monthly) VALUES ('demo', 'Demo Plan', 0) RETURNING id`);
+            }
+            const planId = planRes.rows[0].id;
+
+            // Генерируем API Key
+            const apiKey = crypto.randomBytes(32).toString('hex');
+
+            // Создаем Тенант
+            const tenantRes = await client.query(
+                `INSERT INTO tenants (name, plan_id, is_active, api_key, owner_user_id)
+                 VALUES ($1, $2, true, $3, $4)
+                 RETURNING id`,
+                [`Компания ${fullName}`, planId, apiKey, tgId]
+            );
+            const tenantId = tenantRes.rows[0].id;
+
+            // Создаем Админа
+            const defaultPass = await bcrypt.hash('admin123', 10);
+            const adminUser = await client.query(
+                `INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active)
+                 VALUES ($1, $2, 'admin', $3, $4, $5, true)
+                 RETURNING id, full_name, role`,
+                [tgId, fullName, tenantId, login, defaultPass]
+            );
+
+            // Демо-данные: Машина
+            await client.query(
+                `INSERT INTO dict_trucks (tenant_id, code, name, plate, is_active, is_busy)
+                 VALUES ($1, 'AUTO-01', 'Тестовый Грузовик', 'A777AA 77', true, false)`,
+                [tenantId]
+            );
+
+            // Демо-данные: Объект
+            await client.query(
+                `INSERT INTO dict_sites (tenant_id, code, name, address, is_active)
+                 VALUES ($1, 'BASE-01', 'Главный Склад', 'г. Москва, Центр', true)`,
+                [tenantId]
+            );
+
+            await client.query('COMMIT');
+
+            return res.json({
+                status: 'created_tenant',
+                message: 'Компания создана! Вы администратор.',
+                user: adminUser.rows[0],
+                api_key: apiKey // Отдаем ключ, чтобы n8n мог его сохранить
+            });
+
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        }
+
+    } catch (error) {
+        console.error('Onboarding Error:', error);
+        res.status(500).json({ error: 'Server error processing webhook' });
+    } finally {
+        client.release(); // Обязательно возвращаем клиента в пул
+    }
 });
 
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
