@@ -111,6 +111,30 @@ app.post('/api/users', authenticateToken, async (req: AuthRequest, res: Response
     } catch (err) { res.status(500).send('Error creating user'); }
 });
 
+// Обновление ID сообщения с меню (чтобы удалять старое и делать "чистый чат")
+app.post('/api/users/set-menu-id', authenticateToken, async (req: AuthRequest, res: Response) => {
+    const { message_id } = req.body;
+    
+    // Если запрос от n8n (system), то ID юзера берем из тела запроса.
+    // Если запрос от самого юзера (теоретически), то из токена.
+    let userId = req.user.id;
+    if (req.user.role === 'system') {
+        userId = req.body.user_id;
+    }
+
+    if (!userId || !message_id) {
+        return res.status(400).json({ error: 'Missing user_id or message_id' });
+    }
+
+    try {
+        await pool.query('UPDATE users SET last_menu_message_id = $1 WHERE id = $2', [message_id, userId]);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('Error setting menu id:', e);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
 // 3. READ DATA
 app.get('/api/dashboard/stats', authenticateToken, async (req: AuthRequest, res: Response) => {
     try {
