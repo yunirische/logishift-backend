@@ -187,8 +187,11 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
 
 app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: Response) => {
     const { truck_id, site_id, geo, photo_url, mileage } = req.body;
+    
     let user_id = req.user.id;
+    // Если запрос от системы (n8n), берем user_id из тела запроса
     if (req.user.role === 'system') user_id = req.body.user_id;
+    
     const tenant_id = req.user.tenant_id;
 
     try {
@@ -201,11 +204,16 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: R
         );
         res.json(result.rows[0]);
     } catch (err: any) { 
-        console.error(err); 
-        if (err.message && err.message.includes('Active shift already exists')) {
-            return res.status(400).json({ error: 'У вас уже есть активная смена' });
+        console.error('Shift Start Error:', err.message); 
+        
+        // Если ошибка от нашего триггера (текст содержит ключевые слова)
+        if (err.message && (err.message.includes('already has an active shift') || err.message.includes('already busy'))) {
+            // Возвращаем 409 (Conflict) и понятный текст
+            return res.status(409).json({ error: err.message });
         }
-        res.status(500).send('Error'); 
+        
+        // Любая другая ошибка (например, нет такого truck_id)
+        res.status(500).json({ error: err.message || 'Server error' }); 
     }
 });
 
