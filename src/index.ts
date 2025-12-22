@@ -195,16 +195,19 @@ app.post('/api/sites', authenticateToken, async (req: AuthRequest, res: Response
 app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: Response) => {
     const targetUserId = req.user.role === 'system' ? req.query.user_id : req.user.id;
     try { 
-        // JOIN для получения имен
+        // JOIN tenants для получения настроек
         const sql = `
             SELECT s.*, 
                    t.name as truck_name, 
                    t.plate as truck_plate,
                    st.name as site_name,
-                   st.address as site_address
+                   st.address as site_address,
+                   ten.timezone as tenant_timezone,
+                   ten.invoice_required as tenant_invoice_required
             FROM shifts s
             LEFT JOIN dict_trucks t ON s.truck_id = t.id
             LEFT JOIN dict_sites st ON s.site_id = st.id
+            LEFT JOIN tenants ten ON s.tenant_id = ten.id
             WHERE s.user_id = $1 AND s.status = 'active' 
             LIMIT 1
         `;
@@ -212,14 +215,12 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
         res.json(result.rows[0] || null); 
     } catch (err) { res.status(500).send('Error'); }
 });
-
 app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: Response) => {
     const { truck_id, site_id, geo, photo_url, mileage } = req.body;
     
     let user_id = req.user.id;
     let tenant_id = req.user.tenant_id;
 
-    // ИСПРАВЛЕНИЕ: Если запрос от n8n (system), находим реальный tenant_id пользователя
     if (req.user.role === 'system') {
         user_id = req.body.user_id;
         try {
@@ -236,7 +237,6 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: R
     }
 
     try {
-        // Используем CTE + JOIN для возврата имен сразу после вставки
         const sql = `
             WITH inserted_shift AS (
                 INSERT INTO shifts 
@@ -248,17 +248,19 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: R
                 s.*,
                 t.name as truck_name, 
                 t.plate as truck_plate,
-                st.name as site_name
+                st.name as site_name,
+                ten.timezone as tenant_timezone,
+                ten.invoice_required as tenant_invoice_required
             FROM inserted_shift s
             LEFT JOIN dict_trucks t ON s.truck_id = t.id
             LEFT JOIN dict_sites st ON s.site_id = st.id
+            LEFT JOIN tenants ten ON s.tenant_id = ten.id
         `;
         const result = await pool.query(sql, [user_id, tenant_id, truck_id, site_id, geo, photo_url, mileage || 0]);
         res.json(result.rows[0]);
 
     } catch (err: any) { 
         console.error('Shift Start Error:', err.message); 
-        // Возвращаем 409 Conflict при ошибках триггера БД
         if (err.message && (err.message.includes('already has an active shift') || err.message.includes('already busy'))) {
             return res.status(409).json({ error: err.message });
         }
@@ -316,7 +318,13 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
 
     try {
         // 1. ПРОВЕРКА: Существует ли юзер?
-        const userCheck = await client.query('SELECT * FROM users WHERE telegram_user_id = $1', [tgId]);
+        // Делаем JOIN с tenants, чтобы сразу получить настройки
+        const userCheck = await client.query(`
+            SELECT u.*, t.timezone, t.invoice_required 
+            FROM users u
+            LEFT JOIN tenants t ON u.tenant_id = t.id
+            WHERE u.telegram_user_id = $1
+        `, [tgId]);
         
         if (userCheck.rows.length > 0) {
             const user = userCheck.rows[0];
@@ -324,7 +332,14 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
                 status: 'active_user',
                 message: `С возвращением, ${user.full_name}!`,
                 role: user.role,
-                user: user
+                user: {
+                    ...user,
+                    // Явно выносим настройки на верхний уровень для удобства n8n
+                    tenant_settings: {
+                        timezone: user.timezone,
+                        invoice_required: user.invoice_required
+                    }
+                }
             });
         }
 
