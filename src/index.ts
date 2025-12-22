@@ -189,10 +189,25 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: R
     const { truck_id, site_id, geo, photo_url, mileage } = req.body;
     
     let user_id = req.user.id;
-    // Если запрос от системы (n8n), берем user_id из тела запроса
-    if (req.user.role === 'system') user_id = req.body.user_id;
-    
-    const tenant_id = req.user.tenant_id;
+    let tenant_id = req.user.tenant_id;
+
+    // ЛОГИКА SYSTEM (n8n):
+    // Если запрос от бота, мы должны найти реальный tenant_id самого юзера,
+    // а не использовать tenant_id админа, чей ключ вставлен в n8n.
+    if (req.user.role === 'system') {
+        user_id = req.body.user_id;
+        try {
+            const uRes = await pool.query('SELECT tenant_id FROM users WHERE id = $1', [user_id]);
+            if (uRes.rows.length > 0) {
+                tenant_id = uRes.rows[0].tenant_id;
+            } else {
+                return res.status(404).json({ error: 'User not found' });
+            }
+        } catch (e) {
+            console.error(e);
+            return res.status(500).json({ error: 'DB Error fetching user tenant' });
+        }
+    }
 
     try {
         const result = await pool.query(
@@ -206,17 +221,13 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: R
     } catch (err: any) { 
         console.error('Shift Start Error:', err.message); 
         
-        // Если ошибка от нашего триггера (текст содержит ключевые слова)
         if (err.message && (err.message.includes('already has an active shift') || err.message.includes('already busy'))) {
-            // Возвращаем 409 (Conflict) и понятный текст
             return res.status(409).json({ error: err.message });
         }
         
-        // Любая другая ошибка (например, нет такого truck_id)
         res.status(500).json({ error: err.message || 'Server error' }); 
     }
 });
-
 app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res: Response) => {
     const { geo, photo_url, mileage, comments } = req.body;
     let user_id = req.user.id;
