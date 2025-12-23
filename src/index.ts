@@ -329,14 +329,14 @@ app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res: Res
 // 6. ONBOARDING (TELEGRAM / N8N WEBHOOK)
 // ==========================================
 app.post('/api/integrations/telegram/webhook', async (req: Request, res: Response) => {
+    // 1. Сначала достаем данные из тела запроса
     const { id: tgId, username, first_name, last_name, text } = req.body;
     if (!tgId) return res.status(400).json({ error: 'Missing Telegram User ID' });
 
-    const fullName = [first_name, last_name].filter(Boolean).join(' ') || username || 'Unknown';
-    const login = username || `tg_${tgId}`; 
     const client = await pool.connect();
 
     try {
+        // 2. Проверяем, существует ли пользователь
         const userCheck = await client.query(`
             SELECT u.*, t.timezone, t.invoice_required 
             FROM users u
@@ -344,78 +344,101 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
             WHERE u.telegram_user_id = $1
         `, [tgId]);
         
-        if (userCheck.rows.length > 0) {
-            const user = userCheck.rows[0];
-            const cmd = text ? text.split(' ')[0] : '';
+        // Если пользователь не найден — логика регистрации (инвайты/создание компании)
+        if (userCheck.rows.length === 0) {
+            // ... (здесь твой старый код логики инвайтов и создания админа) ...
+            // Не забудь в конце этого блока добавить return, чтобы код ниже не выполнялся
+            return; 
+        }
 
-            let action = 'show_driver_menu'; // Дефолт для водителя
+        // 3. Если мы здесь — пользователь существует
+        const user = userCheck.rows[0];
+        if (!user.is_active) return res.json({ action: 'error_blocked', text: 'Доступ заблокирован.' });
 
-            if (user.role === 'admin') {
-                // Если админ просит специфические "водительские" команды или /driver
-                if (['/status', '/start_shift', '/end_shift', '/driver'].includes(cmd)) {
-                    
-                    // Логика черновика смены для /start_shift (общая для admin/driver)
-                    if (cmd === '/start_shift') {
-                        // 1. Проверяем, нет ли уже активной смены или черновика
-                        const activeShift = await client.query(
-                            `SELECT id FROM shifts WHERE user_id = $1 AND status != 'finished'`, 
-                            [user.id]
-                        );
+        const cmd = text ? text.split(' ')[0] : '';
 
-                        if (activeShift.rows.length === 0) {
-                            // 2. Создаем черновик, если ничего нет
-                            await client.query(
-                                `INSERT INTO shifts (user_id, tenant_id, status) VALUES ($1, $2, 'pending_truck')`,
-                                [user.id, user.tenant_id]
-                            );
-                        }
-                    }
-                    
-                    // Если это /driver, переводим в меню водителя, иначе в соответствующий экшен
-                    action = (cmd === '/driver') ? 'show_driver_menu' : cmd.replace('/', '');
-                } else {
-                    // Во всех остальных случаях админ видит админ-меню
-                    action = 'show_admin_menu';
-                }
-            } else {
-                // Логика для обычного водителя
-                if (cmd === '/status') {
-                    action = 'status';
-                }
-                else if (cmd === '/start_shift') {
-                    // Логика черновика смены для водителя
-                    const activeShift = await client.query(
-                        `SELECT id FROM shifts WHERE user_id = $1 AND status != 'finished'`,
-                        [user.id]
-                    );
+        // --- ЛОГИКА ОБРАБОТКИ КОМАНД (Выбор машины) ---
+        const truckMatch = text ? text.match(/\/select_truck_(\d+)/) : null;
 
-                    if (activeShift.rows.length === 0) {
-                        await client.query(
-                            `INSERT INTO shifts (user_id, tenant_id, status)
-                             VALUES ($1, $2, 'pending_truck')`,
-                            [user.id, user.tenant_id]
-                        );
-                    }
-                    action = 'start_shift'; // n8n поймет, что нужно показать список машин
-                }
-                else if (cmd === '/end_shift') {
-                    action = 'end_shift';
-                }
-            }
-
+        if (truckMatch) {
+            const truckId = truckMatch[1];
+            // Обновляем черновик
+            await client.query(
+                `UPDATE shifts SET truck_id = $1, status = 'pending_site' 
+                 WHERE user_id = $2 AND status = 'pending_truck'`,
+                [truckId, user.id]
+            );
             return res.json({
-                action: action,
-                text: `С возвращением, ${user.full_name}!`,
+                action: 'select_site',
+                text: 'Отлично! Теперь выберите объект, на котором будете работать:',
                 user: {
                     id: user.id,
-                    role: user.role,
                     tenant_id: user.tenant_id,
-                    full_name: user.full_name,
-                    last_menu_message_id: user.last_menu_message_id, // КРИТИЧНО для чистого чата
-                    timezone: user.timezone,
-                    invoice_required: user.invoice_required
+                    last_menu_message_id: user.last_menu_message_id
                 }
             });
+        }
+
+        // --- ЛОГИКА ОБРАБОТКИ КОМАНД (Выбор объекта) ---
+        const siteMatch = text ? text.match(/\/select_site_(\d+)/) : null;
+        if (siteMatch) {
+            const siteId = siteMatch[1];
+            // Финализируем смену
+            await client.query(
+                `UPDATE shifts SET site_id = $1, status = 'active', start_time = NOW() 
+                 WHERE user_id = $2 AND status = 'pending_site'`,
+                [siteId, user.id]
+            );
+            return res.json({
+                action: 'status', // Сразу показываем статус новой смены
+                text: 'Смена успешно открыта! Удачной работы.',
+                user: {
+                    id: user.id,
+                    tenant_id: user.tenant_id,
+                    last_menu_message_id: user.last_menu_message_id
+                }
+            });
+        }
+
+        // --- СТАНДАРТНЫЕ КОМАНДЫ (Action Mapping) ---
+        let action = 'show_driver_menu';
+        if (user.role === 'admin' && cmd === '/admin') action = 'show_admin_menu';
+        else if (cmd === '/driver') action = 'show_driver_menu';
+        else if (cmd === '/status') action = 'status';
+        else if (cmd === '/start_shift') {
+            // Логика создания черновика
+            const activeShift = await client.query(
+                `SELECT id FROM shifts WHERE user_id = $1 AND status != 'finished'`, 
+                [user.id]
+            );
+            if (activeShift.rows.length === 0) {
+                await client.query(
+                    `INSERT INTO shifts (user_id, tenant_id, status) VALUES ($1, $2, 'pending_truck')`,
+                    [user.id, user.tenant_id]
+                );
+            }
+            action = 'start_shift';
+        }
+        else if (cmd === '/end_shift') action = 'end_shift';
+
+        return res.json({
+            action: action,
+            text: `С возвращением, ${user.full_name}!`,
+            user: {
+                id: user.id,
+                role: user.role,
+                tenant_id: user.tenant_id,
+                last_menu_message_id: user.last_menu_message_id
+            }
+        });
+
+    } catch (error) {
+        console.error('Webhook Error:', error);
+        res.status(500).json({ error: 'Server error' });
+    } finally {
+        client.release();
+    }
+});
         }
 
         const inviteMatch = text ? text.match(/^\/start\s+(.+)$/) : null;
