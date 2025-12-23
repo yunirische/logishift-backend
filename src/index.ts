@@ -184,6 +184,21 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
                 });
             }
 
+            // 3. Любой текст (не команда) трактуем как комментарий к смене
+    if (text && !text.startsWith('/')) {
+        await client.query(
+            `UPDATE shifts 
+             SET end_time = NOW(), status = 'pending_invoice', comments = $1 
+             WHERE user_id = $2 AND status = 'active'`,
+            [text, user.id]
+        );
+        return res.json({
+            action: 'status',
+            text: '✅ Смена закрыта с комментарием. Ждем фото накладной.',
+            user: user
+        });
+    }
+
             // Остальной дефолтный ответ для активного юзера
             return res.json({
                 status: 'active_user',
