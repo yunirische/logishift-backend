@@ -346,25 +346,62 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
         
         if (userCheck.rows.length > 0) {
             const user = userCheck.rows[0];
-const cmd = text ? text.split(' ')[0] : '';
+            const cmd = text ? text.split(' ')[0] : '';
 
-let action = 'show_driver_menu'; // Дефолт для водителя
+            let action = 'show_driver_menu'; // Дефолт для водителя
 
-if (user.role === 'admin') {
-    // Если админ просит специфические "водительские" команды или /driver
-    if (['/status', '/start_shift', '/end_shift', '/driver'].includes(cmd)) {
-        // Если это /driver, переводим в меню водителя, иначе в соответствующий экшен
-        action = (cmd === '/driver') ? 'show_driver_menu' : cmd.replace('/', '');
-    } else {
-        // Во всех остальных случаях админ видит админ-меню
-        action = 'show_admin_menu';
-    }
-} else {
-    // Логика для обычного водителя (как была)
-    if (cmd === '/status') action = 'status';
-    else if (cmd === '/start_shift') action = 'start_shift';
-    else if (cmd === '/end_shift') action = 'end_shift';
-}
+            if (user.role === 'admin') {
+                // Если админ просит специфические "водительские" команды или /driver
+                if (['/status', '/start_shift', '/end_shift', '/driver'].includes(cmd)) {
+                    
+                    // Логика черновика смены для /start_shift (общая для admin/driver)
+                    if (cmd === '/start_shift') {
+                        // 1. Проверяем, нет ли уже активной смены или черновика
+                        const activeShift = await client.query(
+                            `SELECT id FROM shifts WHERE user_id = $1 AND status != 'finished'`, 
+                            [user.id]
+                        );
+
+                        if (activeShift.rows.length === 0) {
+                            // 2. Создаем черновик, если ничего нет
+                            await client.query(
+                                `INSERT INTO shifts (user_id, tenant_id, status) VALUES ($1, $2, 'pending_truck')`,
+                                [user.id, user.tenant_id]
+                            );
+                        }
+                    }
+                    
+                    // Если это /driver, переводим в меню водителя, иначе в соответствующий экшен
+                    action = (cmd === '/driver') ? 'show_driver_menu' : cmd.replace('/', '');
+                } else {
+                    // Во всех остальных случаях админ видит админ-меню
+                    action = 'show_admin_menu';
+                }
+            } else {
+                // Логика для обычного водителя
+                if (cmd === '/status') {
+                    action = 'status';
+                }
+                else if (cmd === '/start_shift') {
+                    // Логика черновика смены для водителя
+                    const activeShift = await client.query(
+                        `SELECT id FROM shifts WHERE user_id = $1 AND status != 'finished'`,
+                        [user.id]
+                    );
+
+                    if (activeShift.rows.length === 0) {
+                        await client.query(
+                            `INSERT INTO shifts (user_id, tenant_id, status)
+                             VALUES ($1, $2, 'pending_truck')`,
+                            [user.id, user.tenant_id]
+                        );
+                    }
+                    action = 'start_shift'; // n8n поймет, что нужно показать список машин
+                }
+                else if (cmd === '/end_shift') {
+                    action = 'end_shift';
+                }
+            }
 
             return res.json({
                 action: action,
@@ -482,5 +519,6 @@ if (user.role === 'admin') {
         client.release();
     }
 });
+
 
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
