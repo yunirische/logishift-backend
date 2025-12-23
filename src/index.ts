@@ -71,7 +71,69 @@ const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunc
 
 // --- ROUTES ---
 // [ВСЕ ROUTES ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ - auth, users, dashboard, shifts, etc.]
-// ... (ваш код до webhook остается как есть) ...
+// ✅ 1. СОХРАНЕНИЕ ID МЕНЮ (Для чистого чата)
+app.post('/api/users/set-menu-id', authenticateToken, async (req: AuthRequest, res: Response) => {
+    const { message_id, user_id: bodyUserId } = req.body;
+    let userId = req.user.id;
+    
+    // Если запрос от n8n (role: system), берем user_id из тела запроса
+    if (req.user.role === 'system') userId = bodyUserId;
+
+    if (!userId || !message_id) return res.status(400).json({ error: 'Missing data' });
+
+    try {
+        await pool.query('UPDATE users SET last_menu_message_id = $1 WHERE id = $2', [message_id, userId]);
+        res.json({ success: true });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+// ✅ 2. ПОЛУЧЕНИЕ СПИСКА МАШИН (Для Driver_Start)
+app.get('/api/trucks', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try { 
+        const tenantId = req.user.role === 'system' ? req.query.tenant_id : req.user.tenant_id;
+        const result = await pool.query(
+            'SELECT * FROM dict_trucks WHERE tenant_id = $1 AND is_active = true ORDER BY name', 
+            [tenantId]
+        ); 
+        res.json(result.rows); 
+    } catch (err) { res.status(500).send('Error'); }
+});
+
+// ✅ 3. ПОЛУЧЕНИЕ СПИСКА ОБЪЕКТОВ (Для Driver_Start)
+app.get('/api/sites', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try { 
+        const tenantId = req.user.role === 'system' ? req.query.tenant_id : req.user.tenant_id;
+        const result = await pool.query(
+            'SELECT * FROM dict_sites WHERE tenant_id = $1 AND is_active = true ORDER BY name', 
+            [tenantId]
+        ); 
+        res.json(result.rows); 
+    } catch (err) { res.status(500).send('Error'); }
+});
+
+// ✅ 4. ПОЛУЧЕНИЕ ТЕКУЩЕЙ СМЕНЫ (Для Driver_Status)
+app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: Response) => {
+    const targetUserId = req.user.role === 'system' ? req.query.user_id : req.user.id;
+    if (!targetUserId) return res.status(400).json({ error: 'Missing user_id' });
+
+    try { 
+        const sql = `
+            SELECT s.*, t.name as truck_name, t.plate as truck_plate, st.name as site_name,
+                   ten.timezone as tenant_timezone, ten.invoice_required as tenant_invoice_required
+            FROM shifts s
+            LEFT JOIN dict_trucks t ON s.truck_id = t.id
+            LEFT JOIN dict_sites st ON s.site_id = st.id
+            LEFT JOIN tenants ten ON s.tenant_id = ten.id
+            WHERE s.user_id = $1 AND s.status IN ('active', 'pending_invoice', 'pending_truck', 'pending_site')
+            ORDER BY s.id DESC LIMIT 1
+        `;
+        const result = await pool.query(sql, [targetUserId]); 
+        res.json(result.rows[0] || null); 
+    } catch (err) { res.status(500).json({ error: 'Internal server error' }); }
+});
 
 // ==========================================
 // 6. ONBOARDING (TELEGRAM / N8N WEBHOOK) - ИСПРАВЛЕННАЯ ВЕРСИЯ
