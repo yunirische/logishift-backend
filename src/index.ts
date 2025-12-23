@@ -161,27 +161,26 @@ app.get('/api/shifts', authenticateToken, async (req: AuthRequest, res: Response
 });
 
 app.get('/api/trucks', authenticateToken, async (req: AuthRequest, res: Response) => {
-    try { const result = await pool.query('SELECT * FROM dict_trucks WHERE tenant_id = $1 AND is_active = true ORDER BY name', [req.user.tenant_id]); res.json(result.rows); } catch (err) { res.status(500).send('Error'); }
-});
-app.post('/api/trucks', authenticateToken, async (req: AuthRequest, res: Response) => {
-    if (req.user.role !== 'admin' && req.user.role !== 'system') return res.status(403).send('Denied');
-    const { name, plate, code } = req.body;
-    try {
-        const result = await pool.query("INSERT INTO dict_trucks (tenant_id, name, plate, code, is_active) VALUES ($1, $2, $3, $4, true) RETURNING *", [req.user.tenant_id, name, plate, code]);
-        res.json(result.rows[0]);
-    } catch (e) { res.status(500).send('Error'); }
+    try { 
+        // Если n8n (system), берем tenant_id из query
+        const tenantId = req.user.role === 'system' ? req.query.tenant_id : req.user.tenant_id;
+        const result = await pool.query(
+            'SELECT * FROM dict_trucks WHERE tenant_id = $1 AND is_active = true ORDER BY name', 
+            [tenantId]
+        ); 
+        res.json(result.rows); 
+    } catch (err) { res.status(500).send('Error'); }
 });
 
 app.get('/api/sites', authenticateToken, async (req: AuthRequest, res: Response) => {
-    try { const result = await pool.query('SELECT * FROM dict_sites WHERE tenant_id = $1 AND is_active = true ORDER BY name', [req.user.tenant_id]); res.json(result.rows); } catch (err) { res.status(500).send('Error'); }
-});
-app.post('/api/sites', authenticateToken, async (req: AuthRequest, res: Response) => {
-    if (req.user.role !== 'admin' && req.user.role !== 'system') return res.status(403).send('Denied');
-    const { name, address, code } = req.body;
-    try {
-        const result = await pool.query("INSERT INTO dict_sites (tenant_id, name, address, code, is_active) VALUES ($1, $2, $3, $4, true) RETURNING *", [req.user.tenant_id, name, address, code]);
-        res.json(result.rows[0]);
-    } catch (e) { res.status(500).send('Error'); }
+    try { 
+        const tenantId = req.user.role === 'system' ? req.query.tenant_id : req.user.tenant_id;
+        const result = await pool.query(
+            'SELECT * FROM dict_sites WHERE tenant_id = $1 AND is_active = true ORDER BY name', 
+            [tenantId]
+        ); 
+        res.json(result.rows); 
+    } catch (err) { res.status(500).send('Error'); }
 });
 
 // ==========================================
@@ -332,16 +331,13 @@ app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res: Res
 // ==========================================
 app.post('/api/integrations/telegram/webhook', async (req: Request, res: Response) => {
     const { id: tgId, username, first_name, last_name, text } = req.body;
-
     if (!tgId) return res.status(400).json({ error: 'Missing Telegram User ID' });
 
     const fullName = [first_name, last_name].filter(Boolean).join(' ') || username || 'Unknown';
     const login = username || `tg_${tgId}`; 
-
     const client = await pool.connect();
 
     try {
-        // 1. ПРОВЕРКА: Существует ли юзер?
         const userCheck = await client.query(`
             SELECT u.*, t.timezone, t.invoice_required 
             FROM users u
@@ -351,20 +347,31 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
         
         if (userCheck.rows.length > 0) {
             const user = userCheck.rows[0];
-            
+            if (!user.is_active) return res.json({ action: 'error_blocked', text: 'Доступ заблокирован.' });
+
+            // --- ЛОГИКА ОПРЕДЕЛЕНИЯ ACTION ---
             let action = 'show_driver_menu';
-            if (user.role === 'admin') action = 'show_admin_menu';
-            if (!user.is_active) action = 'error_blocked';
+            const cmd = text ? text.split(' ')[0] : '';
+
+            if (user.role === 'admin') {
+                action = (cmd === '/admin') ? 'show_admin_menu' : 'show_admin_menu';
+            } else {
+                if (cmd === '/status') action = 'status';
+                else if (cmd === '/start_shift') action = 'start_shift';
+                else if (cmd === '/end_shift') action = 'end_shift';
+            }
 
             return res.json({
                 action: action,
                 text: `С возвращением, ${user.full_name}!`,
                 user: {
-                    ...user,
-                    tenant_settings: {
-                        timezone: user.timezone,
-                        invoice_required: user.invoice_required
-                    }
+                    id: user.id,
+                    role: user.role,
+                    tenant_id: user.tenant_id,
+                    full_name: user.full_name,
+                    last_menu_message_id: user.last_menu_message_id, // КРИТИЧНО для чистого чата
+                    timezone: user.timezone,
+                    invoice_required: user.invoice_required
                 }
             });
         }
