@@ -347,19 +347,25 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
         
         if (userCheck.rows.length > 0) {
             const user = userCheck.rows[0];
-            if (!user.is_active) return res.json({ action: 'error_blocked', text: 'Доступ заблокирован.' });
+const cmd = text ? text.split(' ')[0] : '';
 
-            // --- ЛОГИКА ОПРЕДЕЛЕНИЯ ACTION ---
-            let action = 'show_driver_menu';
-            const cmd = text ? text.split(' ')[0] : '';
+let action = 'show_driver_menu'; // Дефолт для водителя
 
-            if (user.role === 'admin') {
-                action = (cmd === '/admin') ? 'show_admin_menu' : 'show_admin_menu';
-            } else {
-                if (cmd === '/status') action = 'status';
-                else if (cmd === '/start_shift') action = 'start_shift';
-                else if (cmd === '/end_shift') action = 'end_shift';
-            }
+if (user.role === 'admin') {
+    // Если админ просит специфические "водительские" команды или /driver
+    if (['/status', '/start_shift', '/end_shift', '/driver'].includes(cmd)) {
+        // Если это /driver, переводим в меню водителя, иначе в соответствующий экшен
+        action = (cmd === '/driver') ? 'show_driver_menu' : cmd.replace('/', '');
+    } else {
+        // Во всех остальных случаях админ видит админ-меню
+        action = 'show_admin_menu';
+    }
+} else {
+    // Логика для обычного водителя (как была)
+    if (cmd === '/status') action = 'status';
+    else if (cmd === '/start_shift') action = 'start_shift';
+    else if (cmd === '/end_shift') action = 'end_shift';
+}
 
             return res.json({
                 action: action,
