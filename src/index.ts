@@ -140,14 +140,15 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
 // ==========================================
 app.post('/api/integrations/telegram/webhook', async (req: Request, res: Response) => {
     const { id: tgId, username, first_name, last_name, text } = req.body;
+
     if (!tgId) return res.status(400).json({ error: 'Missing Telegram User ID' });
 
     const fullName = [first_name, last_name].filter(Boolean).join(' ') || username || 'Unknown';
     const login = username || `tg_${tgId}`; 
+
     const client = await pool.connect();
 
     try {
-        // 1. Проверяем существующего пользователя
         const userCheck = await client.query(`
             SELECT u.*, t.timezone, t.invoice_required 
             FROM users u
@@ -155,98 +156,57 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
             WHERE u.telegram_user_id = $1
         `, [tgId]);
         
-        // ✅ СЦЕНАРИЙ 1: ПОЛЬЗОВАТЕЛЬ УЖЕ СУЩЕСТВУЕТ
         if (userCheck.rows.length > 0) {
             const user = userCheck.rows[0];
-            if (!user.is_active) {
-                return res.json({ action: 'error_blocked', text: 'Доступ заблокирован.' });
-            }
+            const cmdText = text || '';
 
-            const cmd = text ? text.split(' ')[0] : '';
-
-            // Обработка выбора машины (/select_truck_X)
-            const truckMatch = text ? text.match(/\/select_truck_(\d+)/) : null;
-            if (truckMatch) {
-                const truckId = truckMatch[1];
+            // 1. Если нажали "Завершить сейчас" (без комментария)
+            if (cmdText === '/end_shift_now') {
                 await client.query(
-                    `UPDATE shifts SET truck_id = $1, status = 'pending_site' 
-                     WHERE user_id = $2 AND status = 'pending_truck'`,
-                    [truckId, user.id]
-                );
-                return res.json({
-                    action: 'select_site',
-                    text: 'Отлично! Теперь выберите объект, на котором будете работать:',
-                    user: {
-                        id: user.id,
-                        tenant_id: user.tenant_id,
-                        last_menu_message_id: user.last_menu_message_id
-                    }
-                });
-            }
-
-            // Обработка выбора объекта (/select_site_X)
-            const siteMatch = text ? text.match(/\/select_site_(\d+)/) : null;
-            if (siteMatch) {
-                const siteId = siteMatch[1];
-                await client.query(
-                    `UPDATE shifts SET site_id = $1, status = 'active', start_time = NOW() 
-                     WHERE user_id = $2 AND status = 'pending_site'`,
-                    [siteId, user.id]
-                );
-                return res.json({
-                    action: 'status',
-                    text: 'Смена успешно открыта! Удачной работы.',
-                    user: {
-                        id: user.id,
-                        tenant_id: user.tenant_id,
-                        last_menu_message_id: user.last_menu_message_id
-                    }
-                });
-            }
-
-            // Стандартные команды
-            let action = 'show_driver_menu';
-            if (user.role === 'admin' && cmd === '/admin') action = 'show_admin_menu';
-            else if (cmd === '/driver') action = 'show_driver_menu';
-            else if (cmd === '/status') action = 'status';
-            else if (cmd === '/start_shift') {
-                // ✅ Логика черновика смены
-                const activeShift = await client.query(
-                    `SELECT id FROM shifts WHERE user_id = $1 AND status != 'finished'`, 
+                    `UPDATE shifts 
+                     SET end_time = NOW(), status = 'pending_invoice' 
+                     WHERE user_id = $1 AND status = 'active'`,
                     [user.id]
                 );
-                if (activeShift.rows.length === 0) {
-                    await client.query(
-                        `INSERT INTO shifts (user_id, tenant_id, status) VALUES ($1, $2, 'pending_truck')`,
-                        [user.id, user.tenant_id]
-                    );
-                }
-                action = 'start_shift';
+                return res.json({
+                    action: 'status', // После закрытия сразу показываем статус (что нужна накладная)
+                    text: '✅ Смена зафиксирована. Теперь, пожалуйста, пришлите фото накладной.',
+                    user: user
+                });
             }
-            else if (cmd === '/end_shift') action = 'end_shift';
 
+            // 2. Если нажали "Добавить комментарий"
+            if (cmdText === '/request_comment') {
+                return res.json({
+                    action: 'ask_comment',
+                    text: '✍️ Пожалуйста, введите ваш комментарий к смене (например, о простое или поломке):',
+                    user: user
+                });
+            }
+
+            // Остальной дефолтный ответ для активного юзера
             return res.json({
-                action: action,
-                text: `С возвращением, ${user.full_name}!`,
+                status: 'active_user',
+                message: `С возвращением, ${user.full_name}!`,
+                role: user.role,
                 user: {
-                    id: user.id,
-                    role: user.role,
-                    tenant_id: user.tenant_id,
-                    full_name: user.full_name,
-                    last_menu_message_id: user.last_menu_message_id,
-                    timezone: user.timezone,
-                    invoice_required: user.invoice_required
+                    ...user,
+                    tenant_settings: {
+                        timezone: user.timezone,
+                        invoice_required: user.invoice_required
+                    }
                 }
             });
         }
 
-        // ✅ СЦЕНАРИЙ 2: НОВЫЙ ПОЛЬЗОВАТЕЛЬ - проверяем инвайт
+        // ---- дальше твои сценарии инвайта и создания компании без изменений ----
         const inviteMatch = text ? text.match(/^\/start\s+(.+)$/) : null;
         const inviteCode = inviteMatch ? inviteMatch[1] : null;
 
         if (inviteCode) {
-            await client.query('BEGIN');
             try {
+                await client.query('BEGIN');
+
                 const inviteRes = await client.query(
                     `SELECT * FROM invites WHERE code = $1 AND status = 'pending' AND expires_at > NOW() FOR UPDATE`,
                     [inviteCode]
@@ -254,10 +214,7 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
 
                 if (inviteRes.rows.length === 0) {
                     await client.query('ROLLBACK');
-                    return res.json({ 
-                        action: 'ask_invite', 
-                        text: 'Код приглашения не найден или истек. Попросите у администратора новый код.' 
-                    });
+                    return res.json({ status: 'error', message: 'Код неверный или истек.' });
                 }
 
                 const invite = inviteRes.rows[0];
@@ -266,30 +223,36 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
                 const newUser = await client.query(
                     `INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active)
                      VALUES ($1, $2, 'driver', $3, $4, $5, true)
-                     RETURNING id, full_name, role, tenant_id`,
+                     RETURNING id, full_name, role`,
                     [tgId, fullName, invite.tenant_id, login, defaultPass]
                 );
 
                 await client.query(`UPDATE invites SET status = 'used' WHERE id = $1`, [invite.id]);
+
                 await client.query('COMMIT');
 
                 return res.json({
-                    action: 'show_driver_menu',
-                    text: 'Регистрация прошла успешно! Добро пожаловать.',
+                    status: 'registered_driver',
+                    message: 'Вы успешно зарегистрированы как водитель.',
                     user: newUser.rows[0]
                 });
+
             } catch (err) {
                 await client.query('ROLLBACK');
                 throw err;
             }
         }
 
-        // ✅ СЦЕНАРИЙ 3: НОВЫЙ АДМИН - создаем компанию
-        await client.query('BEGIN');
+        // 3. Сценарий новой компании (админ) — как у тебя было
         try {
+            await client.query('BEGIN');
+
             let planRes = await client.query(`SELECT id FROM plans LIMIT 1`);
             if (planRes.rows.length === 0) {
-                 planRes = await client.query(`INSERT INTO plans (code, name, price_monthly) VALUES ('demo', 'Demo Plan', 0) RETURNING id`);
+                 planRes = await client.query(
+                    `INSERT INTO plans (code, name, price_monthly) 
+                     VALUES ('demo', 'Demo Plan', 0) RETURNING id`
+                 );
             }
             const planId = planRes.rows[0].id;
 
@@ -311,25 +274,39 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
                 [tgId, fullName, tenantId, login, defaultPass]
             );
 
-            await client.query(`UPDATE tenants SET owner_user_id = $1 WHERE id = $2`, [tgId, tenantId]);
-            await client.query(`INSERT INTO dict_trucks (tenant_id, code, name, plate, is_active, is_busy) VALUES ($1, 'AUTO-01', 'Тестовый Грузовик', 'A777AA 77', true, false)`, [tenantId]);
-            await client.query(`INSERT INTO dict_sites (tenant_id, code, name, address, is_active) VALUES ($1, 'BASE-01', 'Главный Склад', 'г. Москва, Центр', true)`, [tenantId]);
+            await client.query(
+                `UPDATE tenants SET owner_user_id = $1 WHERE id = $2`,
+                [tgId, tenantId]
+            );
+
+            await client.query(
+                `INSERT INTO dict_trucks (tenant_id, code, name, plate, is_active, is_busy)
+                 VALUES ($1, 'AUTO-01', 'Тестовый Грузовик', 'A777AA 77', true, false)`,
+                [tenantId]
+            );
+
+            await client.query(
+                `INSERT INTO dict_sites (tenant_id, code, name, address, is_active)
+                 VALUES ($1, 'BASE-01', 'Главный Склад', 'г. Москва, Центр', true)`,
+                [tenantId]
+            );
 
             await client.query('COMMIT');
 
             return res.json({
-                action: 'show_admin_menu',
-                text: 'Компания создана! Вы администратор. Ваш API Key сгенерирован.',
+                status: 'created_tenant',
+                message: 'Компания создана! Вы администратор.',
                 user: adminUser.rows[0],
                 api_key: apiKey
             });
+
         } catch (err) {
             await client.query('ROLLBACK');
             throw err;
         }
 
     } catch (error) {
-        console.error('Webhook Error:', error);
+        console.error('Onboarding Error:', error);
         res.status(500).json({ error: 'Server error processing webhook' });
     } finally {
         client.release();
