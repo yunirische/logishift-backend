@@ -136,19 +136,18 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
 });
 
 // ==========================================
-// 6. ONBOARDING (TELEGRAM / N8N WEBHOOK) - ИСПРАВЛЕННАЯ ВЕРСИЯ
+// 6. ONBOARDING (TELEGRAM / N8N WEBHOOK) - ПОЛНАЯ ВЕРСИЯ
 // ==========================================
 app.post('/api/integrations/telegram/webhook', async (req: Request, res: Response) => {
     const { id: tgId, username, first_name, last_name, text } = req.body;
-
     if (!tgId) return res.status(400).json({ error: 'Missing Telegram User ID' });
 
     const fullName = [first_name, last_name].filter(Boolean).join(' ') || username || 'Unknown';
     const login = username || `tg_${tgId}`; 
-
     const client = await pool.connect();
 
     try {
+        // 1. Проверка существующего пользователя
         const userCheck = await client.query(`
             SELECT u.*, t.timezone, t.invoice_required 
             FROM users u
@@ -158,174 +157,138 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
         
         if (userCheck.rows.length > 0) {
             const user = userCheck.rows[0];
-            const cmdText = text || '';
+            if (!user.is_active) return res.json({ action: 'error_blocked', text: 'Доступ заблокирован.' });
 
-            // 1. Если нажали "Завершить сейчас" (без комментария)
-            if (cmdText === '/end_shift_now') {
+            const cmdText = text || '';
+            const cmd = cmdText.split(' ')[0];
+
+            // --- А: СПЕЦИАЛЬНЫЕ КОМАНДЫ ЗАВЕРШЕНИЯ ---
+            if (cmd === '/end_shift_now') {
                 await client.query(
-                    `UPDATE shifts 
-                     SET end_time = NOW(), status = 'pending_invoice' 
+                    `UPDATE shifts SET end_time = NOW(), status = 'pending_invoice' 
                      WHERE user_id = $1 AND status = 'active'`,
                     [user.id]
                 );
                 return res.json({
-                    action: 'status', // После закрытия сразу показываем статус (что нужна накладная)
+                    action: 'status',
                     text: '✅ Смена зафиксирована. Теперь, пожалуйста, пришлите фото накладной.',
                     user: user
                 });
             }
 
-            // 2. Если нажали "Добавить комментарий"
-            if (cmdText === '/request_comment') {
+            if (cmd === '/request_comment') {
                 return res.json({
                     action: 'ask_comment',
-                    text: '✍️ Пожалуйста, введите ваш комментарий к смене (например, о простое или поломке):',
+                    text: '✍️ Пожалуйста, введите ваш комментарий к смене:',
                     user: user
                 });
             }
 
-            // 3. Любой текст (не команда) трактуем как комментарий к смене
-    if (text && !text.startsWith('/')) {
-        await client.query(
-            `UPDATE shifts 
-             SET end_time = NOW(), status = 'pending_invoice', comments = $1 
-             WHERE user_id = $2 AND status = 'active'`,
-            [text, user.id]
-        );
-        return res.json({
-            action: 'status',
-            text: '✅ Смена закрыта с комментарием. Ждем фото накладной.',
-            user: user
-        });
-    }
+            // --- Б: ПАРАМЕТРИЗОВАННЫЕ КОМАНДЫ (ВЫБОР) ---
+            const truckMatch = cmdText.match(/\/select_truck_(\d+)/);
+            if (truckMatch) {
+                await client.query(`UPDATE shifts SET truck_id = $1, status = 'pending_site' WHERE user_id = $2 AND status = 'pending_truck'`, [truckMatch[1], user.id]);
+                return res.json({ action: 'select_site', text: 'Теперь выберите объект:', user: user });
+            }
 
-            // Остальной дефолтный ответ для активного юзера
-            return res.json({
-                status: 'active_user',
-                message: `С возвращением, ${user.full_name}!`,
-                role: user.role,
-                user: {
-                    ...user,
-                    tenant_settings: {
-                        timezone: user.timezone,
-                        invoice_required: user.invoice_required
+            const siteMatch = cmdText.match(/\/select_site_(\d+)/);
+            if (siteMatch) {
+                await client.query(`UPDATE shifts SET site_id = $1, status = 'active', start_time = NOW() WHERE user_id = $2 AND status = 'pending_site'`, [siteMatch[1], user.id]);
+                return res.json({ action: 'status', text: 'Смена открыта!', user: user });
+            }
+
+            // --- В: ОБРАБОТКА ТЕКСТА (КОММЕНТАРИЙ) ---
+            if (cmdText && !cmdText.startsWith('/')) {
+                await client.query(
+                    `UPDATE shifts SET end_time = NOW(), status = 'pending_invoice', comments = $1 
+                     WHERE user_id = $2 AND status = 'active'`,
+                    [cmdText, user.id]
+                );
+                return res.json({ action: 'status', text: '✅ Смена закрыта с комментарием. Ждем фото.', user: user });
+            }
+
+            // --- Г: СТАНДАРТНЫЙ РОУТИНГ (ДЛЯ n8n SWITCH) ---
+            let action = 'show_driver_menu';
+            
+            // Логика для Админа
+            if (user.role === 'admin') {
+                if (['/status', '/start_shift', '/end_shift', '/driver'].includes(cmd)) {
+                    action = (cmd === '/driver') ? 'show_driver_menu' : cmd.replace('/', '');
+                } else {
+                    action = 'show_admin_menu';
+                }
+            } 
+            // Логика для Водителя
+            else {
+                if (cmd === '/status') action = 'status';
+                else if (cmd === '/start_shift') {
+                    const activeShift = await client.query(`SELECT id FROM shifts WHERE user_id = $1 AND status != 'finished'`, [user.id]);
+                    if (activeShift.rows.length === 0) {
+                        await client.query(`INSERT INTO shifts (user_id, tenant_id, status) VALUES ($1, $2, 'pending_truck')`, [user.id, user.tenant_id]);
                     }
+                    action = 'start_shift';
                 }
-            });
-        }
-
-        // ---- дальше твои сценарии инвайта и создания компании без изменений ----
-        const inviteMatch = text ? text.match(/^\/start\s+(.+)$/) : null;
-        const inviteCode = inviteMatch ? inviteMatch[1] : null;
-
-        if (inviteCode) {
-            try {
-                await client.query('BEGIN');
-
-                const inviteRes = await client.query(
-                    `SELECT * FROM invites WHERE code = $1 AND status = 'pending' AND expires_at > NOW() FOR UPDATE`,
-                    [inviteCode]
-                );
-
-                if (inviteRes.rows.length === 0) {
-                    await client.query('ROLLBACK');
-                    return res.json({ status: 'error', message: 'Код неверный или истек.' });
-                }
-
-                const invite = inviteRes.rows[0];
-                const defaultPass = await bcrypt.hash('123456', 10);
-
-                const newUser = await client.query(
-                    `INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active)
-                     VALUES ($1, $2, 'driver', $3, $4, $5, true)
-                     RETURNING id, full_name, role`,
-                    [tgId, fullName, invite.tenant_id, login, defaultPass]
-                );
-
-                await client.query(`UPDATE invites SET status = 'used' WHERE id = $1`, [invite.id]);
-
-                await client.query('COMMIT');
-
-                return res.json({
-                    status: 'registered_driver',
-                    message: 'Вы успешно зарегистрированы как водитель.',
-                    user: newUser.rows[0]
-                });
-
-            } catch (err) {
-                await client.query('ROLLBACK');
-                throw err;
+                else if (cmd === '/end_shift') action = 'end_shift';
             }
-        }
-
-        // 3. Сценарий новой компании (админ) — как у тебя было
-        try {
-            await client.query('BEGIN');
-
-            let planRes = await client.query(`SELECT id FROM plans LIMIT 1`);
-            if (planRes.rows.length === 0) {
-                 planRes = await client.query(
-                    `INSERT INTO plans (code, name, price_monthly) 
-                     VALUES ('demo', 'Demo Plan', 0) RETURNING id`
-                 );
-            }
-            const planId = planRes.rows[0].id;
-
-            const apiKey = crypto.randomBytes(32).toString('hex');
-
-            const tenantRes = await client.query(
-                `INSERT INTO tenants (name, plan_id, is_active, api_key, owner_user_id)
-                 VALUES ($1, $2, true, $3, NULL)
-                 RETURNING id`,
-                [`Компания ${fullName}`, planId, apiKey]
-            );
-            const tenantId = tenantRes.rows[0].id;
-
-            const defaultPass = await bcrypt.hash('admin123', 10);
-            const adminUser = await client.query(
-                `INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active)
-                 VALUES ($1, $2, 'admin', $3, $4, $5, true)
-                 RETURNING id, full_name, role`,
-                [tgId, fullName, tenantId, login, defaultPass]
-            );
-
-            await client.query(
-                `UPDATE tenants SET owner_user_id = $1 WHERE id = $2`,
-                [tgId, tenantId]
-            );
-
-            await client.query(
-                `INSERT INTO dict_trucks (tenant_id, code, name, plate, is_active, is_busy)
-                 VALUES ($1, 'AUTO-01', 'Тестовый Грузовик', 'A777AA 77', true, false)`,
-                [tenantId]
-            );
-
-            await client.query(
-                `INSERT INTO dict_sites (tenant_id, code, name, address, is_active)
-                 VALUES ($1, 'BASE-01', 'Главный Склад', 'г. Москва, Центр', true)`,
-                [tenantId]
-            );
-
-            await client.query('COMMIT');
 
             return res.json({
-                status: 'created_tenant',
-                message: 'Компания создана! Вы администратор.',
-                user: adminUser.rows[0],
-                api_key: apiKey
+                action: action,
+                text: `С возвращением, ${user.full_name}!`,
+                user: {
+                    id: user.id,
+                    role: user.role,
+                    tenant_id: user.tenant_id,
+                    last_menu_message_id: user.last_menu_message_id,
+                    timezone: user.timezone,
+                    invoice_required: user.invoice_required
+                }
             });
-
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
         }
+
+        // --- Д: РЕГИСТРАЦИЯ И НОВЫЕ КОМПАНИИ (ОСТАВЛЯЕМ КАК БЫЛО) ---
+        const inviteMatch = text ? text.match(/^\/start\s+(.+)$/) : null;
+        if (inviteMatch) {
+            const inviteCode = inviteMatch[1];
+            await client.query('BEGIN');
+            const inviteRes = await client.query(`SELECT * FROM invites WHERE code = $1 AND status = 'pending' AND expires_at > NOW() FOR UPDATE`, [inviteCode]);
+            if (inviteRes.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.json({ action: 'ask_invite', text: 'Код неверный или истек.' });
+            }
+            const invite = inviteRes.rows[0];
+            const defaultPass = await bcrypt.hash('123456', 10);
+            const newUser = await client.query(
+                `INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active)
+                 VALUES ($1, $2, 'driver', $3, $4, $5, true) RETURNING id, full_name, role, tenant_id`,
+                [tgId, fullName, invite.tenant_id, login, defaultPass]
+            );
+            await client.query(`UPDATE invites SET status = 'used' WHERE id = $1`, [invite.id]);
+            await client.query('COMMIT');
+            return res.json({ action: 'show_driver_menu', text: 'Регистрация успешна!', user: newUser.rows[0] });
+        }
+
+        // Создание новой компании (Админ)
+        await client.query('BEGIN');
+        const apiKey = crypto.randomBytes(32).toString('hex');
+        const tenantRes = await client.query(`INSERT INTO tenants (name, plan_id, is_active, api_key) VALUES ($1, 1, true, $2) RETURNING id`, [`Компания ${fullName}`, apiKey]);
+        const tenantId = tenantRes.rows[0].id;
+        const adminUser = await client.query(
+            `INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active)
+             VALUES ($1, $2, 'admin', $3, $4, 'admin_pass', true) RETURNING id, full_name, role`,
+            [tgId, fullName, tenantId, login]
+        );
+        await client.query(`UPDATE tenants SET owner_user_id = $1 WHERE id = $2`, [tgId, tenantId]);
+        await client.query(`INSERT INTO dict_trucks (tenant_id, name, plate, is_active) VALUES ($1, 'Тестовый Грузовик', 'A777AA 77', true)`, [tenantId]);
+        await client.query(`INSERT INTO dict_sites (tenant_id, name, address, is_active) VALUES ($1, 'Главный Склад', 'г. Москва', true)`, [tenantId]);
+        await client.query('COMMIT');
+
+        return res.json({ action: 'show_admin_menu', text: 'Компания создана!', user: adminUser.rows[0], api_key: apiKey });
 
     } catch (error) {
-        console.error('Onboarding Error:', error);
-        res.status(500).json({ error: 'Server error processing webhook' });
+        console.error('Webhook Error:', error);
+        res.status(500).json({ error: 'Server error' });
     } finally {
         client.release();
     }
 });
-
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
