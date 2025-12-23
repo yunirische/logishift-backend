@@ -200,10 +200,11 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
             // --- В: ОБРАБОТКА ТЕКСТА (КОММЕНТАРИЙ) ---
 if (cmdText && !cmdText.startsWith('/')) {
     try {
-        // 1. Устанавливаем ID пользователя для триггеров аудита
-        await client.query(`SET LOCAL audit.user_id = $1`, [user.id]);
+        // 1. Устанавливаем ID пользователя через set_config (это поддерживает $1)
+        // Параметры: имя настройки, значение (должно быть строкой), is_local (true)
+        await client.query(`SELECT set_config('audit.user_id', $1, true)`, [user.id.toString()]);
 
-        // 2. Выполняем апдейт (исправлено: comment вместо comments)
+        // 2. Выполняем апдейт
         const updateRes = await client.query(
             `UPDATE shifts 
              SET end_time = NOW(), 
@@ -214,7 +215,6 @@ if (cmdText && !cmdText.startsWith('/')) {
             [cmdText, user.id]
         );
 
-        // Если обновленных строк нет (смена не была активна), просто идем дальше
         if (updateRes.rows.length > 0) {
             return res.json({ 
                 action: 'status', 
@@ -226,13 +226,19 @@ if (cmdText && !cmdText.startsWith('/')) {
                     last_menu_message_id: user.last_menu_message_id
                 }
             });
+        } else {
+            // Если активной смены нет, просто отвечаем как обычно или игнорируем
+            return res.json({
+                action: 'show_driver_menu',
+                text: 'У вас нет активной смены для добавления комментария.',
+                user: user
+            });
         }
     } catch (dbErr) {
         console.error('Database Update Error:', dbErr);
-        throw dbErr; // Пробросим выше, чтобы сработал общий catch
+        throw dbErr;
     }
 }
-
             // --- Г: СТАНДАРТНЫЙ РОУТИНГ (ДЛЯ n8n SWITCH) ---
             let action = 'show_driver_menu';
             
