@@ -185,11 +185,19 @@ app.post('/api/sites', authenticateToken, async (req: AuthRequest, res: Response
 });
 
 // ==========================================
-// 5. SHIFT LOGIC (SMART & HUMAN READABLE)
+// 5. SHIFT LOGIC (ДЛЯ n8n И ПРИЛОЖЕНИЯ)
 // ==========================================
 
+/**
+ * 1. ПОЛУЧИТЬ ТЕКУЩУЮ СМЕНУ
+ * GET /api/shifts/current?user_id=15
+ */
 app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: Response) => {
+    // Если запрос от n8n (system), берем из query, иначе из токена юзера
     const targetUserId = req.user.role === 'system' ? req.query.user_id : req.user.id;
+    
+    if (!targetUserId) return res.status(400).json({ error: 'Missing user_id' });
+
     try { 
         const sql = `
             SELECT s.*, 
@@ -207,16 +215,26 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
             LIMIT 1
         `;
         const result = await pool.query(sql, [targetUserId]); 
+        
+        // n8n получит либо объект смены, либо null
         res.json(result.rows[0] || null); 
-    } catch (err) { res.status(500).send('Error'); }
+    } catch (err) { 
+        console.error('Error fetching current shift:', err);
+        res.status(500).json({ error: 'Internal server error' }); 
+    }
 });
 
+/**
+ * 2. НАЧАТЬ СМЕНУ
+ * POST /api/shifts/start
+ */
 app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: Response) => {
     const { truck_id, site_id, geo, photo_url, mileage } = req.body;
     
     let user_id = req.user.id;
     let tenant_id = req.user.tenant_id;
 
+    // Логика для n8n: определяем реальный тенант водителя
     if (req.user.role === 'system') {
         user_id = req.body.user_id;
         try {
@@ -224,11 +242,10 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: R
             if (uRes.rows.length > 0) {
                 tenant_id = uRes.rows[0].tenant_id;
             } else {
-                return res.status(404).json({ error: 'User not found' });
+                return res.status(404).json({ error: 'User not found in database' });
             }
         } catch (e) {
-            console.error(e);
-            return res.status(500).json({ error: 'DB Error fetching user tenant' });
+            return res.status(500).json({ error: 'Error fetching user context' });
         }
     }
 
@@ -257,6 +274,7 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: R
 
     } catch (err: any) { 
         console.error('Shift Start Error:', err.message); 
+        // Ошибки от триггеров БД (дубли смен / занятые машины)
         if (err.message && (err.message.includes('already has an active shift') || err.message.includes('already busy'))) {
             return res.status(409).json({ error: err.message });
         }
@@ -264,8 +282,13 @@ app.post('/api/shifts/start', authenticateToken, async (req: AuthRequest, res: R
     }
 });
 
+/**
+ * 3. ЗАВЕРШИТЬ СМЕНУ
+ * POST /api/shifts/end
+ */
 app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res: Response) => {
     const { geo, photo_url, mileage, comments } = req.body;
+    
     let user_id = req.user.id;
     if (req.user.role === 'system') user_id = req.body.user_id;
 
@@ -293,9 +316,15 @@ app.post('/api/shifts/end', authenticateToken, async (req: AuthRequest, res: Res
         `;
         const result = await pool.query(sql, [user_id, geo, photo_url, mileage || 0, comments || '']);
         
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Нет активной смены' });
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'No active shift found to end' });
+        }
         res.json(result.rows[0]);
-    } catch (err) { console.error(err); res.status(500).send('Error'); }
+
+    } catch (err: any) { 
+        console.error('Shift End Error:', err.message);
+        res.status(500).json({ error: 'Server error while ending shift' }); 
+    }
 });
 
 // ==========================================
