@@ -188,13 +188,12 @@ app.get('/api/sites', authenticateToken, async (req: AuthRequest, res: Response)
 // ==========================================
 
 /**
+/**
  * 1. ПОЛУЧИТЬ ТЕКУЩУЮ СМЕНУ
- * GET /api/shifts/current?user_id=15
+ * Теперь ищет и активные, и те, что ждут накладную
  */
 app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: Response) => {
-    // Если запрос от n8n (system), берем из query, иначе из токена юзера
     const targetUserId = req.user.role === 'system' ? req.query.user_id : req.user.id;
-    
     if (!targetUserId) return res.status(400).json({ error: 'Missing user_id' });
 
     try { 
@@ -204,21 +203,21 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
                    t.plate as truck_plate,
                    st.name as site_name,
                    st.address as site_address,
+                   st.odometer_required as site_odometer_required, -- Новое поле
                    ten.timezone as tenant_timezone,
                    ten.invoice_required as tenant_invoice_required
             FROM shifts s
             LEFT JOIN dict_trucks t ON s.truck_id = t.id
             LEFT JOIN dict_sites st ON s.site_id = st.id
             LEFT JOIN tenants ten ON s.tenant_id = ten.id
-            WHERE s.user_id = $1 AND s.status = 'active' 
+            WHERE s.user_id = $1 
+              AND s.status IN ('active', 'pending_invoice') -- Ищем оба статуса
+            ORDER BY s.id DESC
             LIMIT 1
         `;
         const result = await pool.query(sql, [targetUserId]); 
-        
-        // n8n получит либо объект смены, либо null
         res.json(result.rows[0] || null); 
     } catch (err) { 
-        console.error('Error fetching current shift:', err);
         res.status(500).json({ error: 'Internal server error' }); 
     }
 });
