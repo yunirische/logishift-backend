@@ -211,7 +211,7 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
             LEFT JOIN dict_sites st ON s.site_id = st.id
             LEFT JOIN tenants ten ON s.tenant_id = ten.id
             WHERE s.user_id = $1 
-              AND s.status IN ('active', 'pending_invoice') -- Ищем оба статуса
+              AND s.status IN ('active', 'pending_invoice', 'pending_truck', 'pending_site') -- Ищем оба статуса
             ORDER BY s.id DESC
             LIMIT 1
         `;
