@@ -198,14 +198,40 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
             }
 
             // --- В: ОБРАБОТКА ТЕКСТА (КОММЕНТАРИЙ) ---
-            if (cmdText && !cmdText.startsWith('/')) {
-                await client.query(
-                    `UPDATE shifts SET end_time = NOW(), status = 'pending_invoice', comments = $1 
-                     WHERE user_id = $2 AND status = 'active'`,
-                    [cmdText, user.id]
-                );
-                return res.json({ action: 'status', text: '✅ Смена закрыта с комментарием. Ждем фото.', user: user });
-            }
+if (cmdText && !cmdText.startsWith('/')) {
+    try {
+        // 1. Устанавливаем ID пользователя для триггеров аудита
+        await client.query(`SET LOCAL audit.user_id = $1`, [user.id]);
+
+        // 2. Выполняем апдейт (исправлено: comment вместо comments)
+        const updateRes = await client.query(
+            `UPDATE shifts 
+             SET end_time = NOW(), 
+                 status = 'pending_invoice', 
+                 comment = $1 
+             WHERE user_id = $2 AND status = 'active'
+             RETURNING id`,
+            [cmdText, user.id]
+        );
+
+        // Если обновленных строк нет (смена не была активна), просто идем дальше
+        if (updateRes.rows.length > 0) {
+            return res.json({ 
+                action: 'status', 
+                text: '✅ Смена закрыта с комментарием. Пожалуйста, пришлите фото накладной.', 
+                user: {
+                    id: user.id,
+                    role: user.role,
+                    tenant_id: user.tenant_id,
+                    last_menu_message_id: user.last_menu_message_id
+                }
+            });
+        }
+    } catch (dbErr) {
+        console.error('Database Update Error:', dbErr);
+        throw dbErr; // Пробросим выше, чтобы сработал общий catch
+    }
+}
 
             // --- Г: СТАНДАРТНЫЙ РОУТИНГ (ДЛЯ n8n SWITCH) ---
             let action = 'show_driver_menu';
