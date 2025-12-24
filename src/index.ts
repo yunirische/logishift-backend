@@ -19,6 +19,7 @@ const CDN_URL = 'https://bot.kontrolsmen.ru/uploads';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
+// --- НАСТРОЙКА ХРАНИЛИЩА ---
 const storage = multer.diskStorage({
     destination: (req: any, file, cb) => {
         const tenantId = req.user?.tenant_id || 'unknown';
@@ -58,7 +59,7 @@ const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunc
     });
 };
 
-// --- МЕТОДЫ API ---
+// --- API МЕТОДЫ ---
 
 app.post('/api/upload', authenticateToken, upload.single('file'), (req: any, res: Response) => {
     if (!req.file) return res.status(400).json({ error: 'Файл не загружен' });
@@ -109,8 +110,8 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
             WHERE u.telegram_user_id = $1`, [tgId]);
         
         if (userRes.rows.length === 0) {
-            // ... (регистрация и создание компании остаются без изменений) ...
-            // Для краткости я не дублирую блок регистрации, он в прошлом сообщении был верным
+            // ... (Блок регистрации из прошлых сообщений) ...
+            return res.json({ action: 'ask_invite', text: 'Зарегистрируйтесь.' });
         }
 
         const user = userRes.rows[0];
@@ -118,51 +119,58 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
         const cmdText = (text || '').trim();
         const cmd = cmdText.split(' ')[0];
 
-        // --- 1. ОБРАБОТКА ФОТО (Улучшенная) ---
+        // --- 1. ОБРАБОТКА ЗАГРУЖЕННОГО ФОТО ---
         if (text === 'PHOTO_UPLOADED') {
             const shiftRes = await client.query(`
                 SELECT s.*, st.odometer_required 
                 FROM shifts s LEFT JOIN dict_sites st ON s.site_id = st.id 
                 WHERE s.user_id = $1 AND s.status != 'finished' LIMIT 1`, [user.id]);
             const shift = shiftRes.rows[0];
-            if (!shift) return res.json({ action: 'show_driver_menu', text: '⚠️ Смена не найдена для привязки фото.', user });
+            if (!shift) return res.json({ action: 'show_driver_menu', text: '⚠️ Смена не найдена.', user });
 
-            // А. Одометр СТАРТ
+            // А. Если мы в процессе ЗАВЕРШЕНИЯ (маркер invoice_requested_at)
+            if (shift.invoice_requested_at) {
+                // Это одометр ФИНИШ?
+                if (shift.odometer_required && !shift.photo_end_url) {
+                    await client.query(`UPDATE shifts SET photo_end_url = $1 WHERE id = $2`, [photo_url, shift.id]);
+                    
+                    if (user.tenant_invoice_required) {
+                        await client.query(`UPDATE shifts SET status = 'pending_invoice' WHERE id = $1`, [shift.id]);
+                        return res.json({ action: 'ask_photo', text: '✅ <b>Одометр (финиш) принят.</b>\nТеперь, пожалуйста, пришлите фото НАКЛАДНОЙ.', user });
+                    } else {
+                        await client.query(`UPDATE shifts SET status = 'finished', end_time = NOW(), invoice_requested_at = NULL WHERE id = $1`, [shift.id]);
+                        return res.json({ action: 'status', text: '🏁 <b>Смена успешно завершена!</b>\nДанные сохранены. Отдыхайте.', user });
+                    }
+                }
+                // Это НАКЛАДНАЯ?
+                if (shift.status === 'pending_invoice') {
+                    await client.query(`UPDATE shifts SET photo_invoice_url = $1, status = 'finished', end_time = NOW(), invoice_requested_at = NULL WHERE id = $2`, [photo_url, shift.id]);
+                    return res.json({ action: 'status', text: '✅ <b>Накладная принята!</b>\nСмена полностью закрыта. Спасибо!', user });
+                }
+            } 
+            
+            // Б. Если мы в процессе СТАРТА
             if (shift.status === 'active' && shift.odometer_required && !shift.photo_start_url) {
                 await client.query(`UPDATE shifts SET photo_start_url = $1 WHERE id = $2`, [photo_url, shift.id]);
-                return res.json({ action: 'status', text: '✅ <b>Фото одометра (старт) принято!</b>\nТеперь вы на смене. Хорошего пути!', user });
+                return res.json({ action: 'status', text: '✅ <b>Фото одометра (старт) принято!</b>\nУдачного рейса!', user });
             }
-            // Б. Одометр ФИНИШ
-            if (shift.status === 'active' && shift.odometer_required && shift.photo_start_url && !shift.photo_end_url) {
-                await client.query(`UPDATE shifts SET photo_end_url = $1 WHERE id = $2`, [photo_url, shift.id]);
-                if (user.tenant_invoice_required) {
-                    await client.query(`UPDATE shifts SET status = 'pending_invoice' WHERE id = $1`, [shift.id]);
-                    return res.json({ action: 'ask_photo', text: '📸 <b>Одометр (финиш) принят!</b>\nПоследний шаг: пришлите фото НАКЛАДНОЙ.', user });
-                } else {
-                    await client.query(`UPDATE shifts SET status = 'finished', end_time = NOW() WHERE id = $1`, [shift.id]);
-                    return res.json({ action: 'status', text: '🏁 <b>Смена завершена!</b>\nОдометр зафиксирован. Отдыхайте.', user });
-                }
-            }
-            // В. НАКЛАДНАЯ
-            if (shift.status === 'pending_invoice') {
-                await client.query(`UPDATE shifts SET photo_invoice_url = $1, status = 'finished', end_time = NOW() WHERE id = $2`, [photo_url, shift.id]);
-                return res.json({ action: 'status', text: '✅ <b>Накладная принята!</b>\nСмена полностью закрыта. Спасибо за работу.', user });
-            }
+
+            return res.json({ action: 'status', text: '📸 Фото получено и сохранено.', user });
         }
 
-        // --- 2. ВЫБОР ОБЪЕКТА / МАШИНЫ (С защитой) ---
+        // --- 2. ВЫБОР ОБЪЕКТА / МАШИНЫ ---
         const siteMatch = cmdText.match(/\/select_site_(\d+)/);
         if (siteMatch) {
             const siteId = siteMatch[1];
             const siteInfo = await client.query(`SELECT name, odometer_required FROM dict_sites WHERE id = $1`, [siteId]);
-            await client.query(`UPDATE shifts SET site_id = $1, status = 'active', start_time = NOW() WHERE user_id = $2 AND status = 'pending_site'`, [siteId, user.id]);
-            const odoMsg = siteInfo.rows[0]?.odometer_required ? '\n\n📸 <b>Внимание:</b> Для этого объекта нужно фото одометра. Пришлите его прямо сейчас.' : '';
-            return res.json({ action: siteInfo.rows[0]?.odometer_required ? 'ask_photo' : 'status', text: `🚀 Смена открыта на объекте <b>${siteInfo.rows[0].name}</b>!${odoMsg}`, user });
+            await client.query(`UPDATE shifts SET site_id = $1, status = 'active', start_time = NOW(), invoice_requested_at = NULL WHERE user_id = $2 AND status = 'pending_site'`, [siteId, user.id]);
+            const odoMsg = siteInfo.rows[0]?.odometer_required ? '\n\n📸 <b>Важно:</b> Объект требует фото одометра. Отправьте его сейчас.' : '';
+            return res.json({ action: siteInfo.rows[0]?.odometer_required ? 'ask_photo' : 'status', text: `🚀 Смена открыта: <b>${siteInfo.rows[0].name}</b>${odoMsg}`, user });
         }
         const truckMatch = cmdText.match(/\/select_truck_(\d+)/);
         if (truckMatch) {
             await client.query(`UPDATE shifts SET truck_id = $1, status = 'pending_site' WHERE user_id = $2 AND status = 'pending_truck'`, [truckMatch[1], user.id]);
-            return res.json({ action: 'select_site', text: '🚚 Машина выбрана. Теперь укажите объект работы:', user });
+            return res.json({ action: 'select_site', text: '🚚 Машина выбрана. Теперь выберите объект:', user });
         }
 
         // --- 3. ЗАВЕРШЕНИЕ СМЕНЫ ---
@@ -172,43 +180,41 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
             
             if (!shift) {
                 const pending = await client.query(`SELECT status FROM shifts WHERE user_id = $1 AND status = 'pending_invoice'`, [user.id]);
-                if (pending.rows.length > 0) return res.json({ action: 'status', text: '⏳ Смена уже ожидает накладную. Пришлите фото.', user });
-                return res.json({ action: 'show_driver_menu', text: '❌ У вас нет активной смены для завершения.', user });
+                if (pending.rows.length > 0) return res.json({ action: 'status', text: '⏳ Смена уже закрывается. Ждем фото накладной.', user });
+                return res.json({ action: 'show_driver_menu', text: '❌ У вас нет активной смены.', user });
             }
 
+            // Ставим маркер начала процесса закрытия
+            await client.query(`UPDATE shifts SET invoice_requested_at = NOW() WHERE id = $1`, [shift.id]);
             if (!cmdText.startsWith('/')) await client.query(`UPDATE shifts SET comment = $1 WHERE id = $2`, [cmdText, shift.id]);
 
             if (shift.odometer_required && !shift.photo_end_url) {
-                return res.json({ action: 'ask_photo', text: '🏁 <b>Завершение смены:</b>\nПожалуйста, пришлите фото ОДОМЕТРА.', user });
+                return res.json({ action: 'ask_photo', text: '🏁 <b>Завершение смены (Шаг 1 из 2):</b>\nПришлите фото ОДОМЕТРА.', user });
             }
             if (user.tenant_invoice_required) {
                 await client.query(`UPDATE shifts SET status = 'pending_invoice' WHERE id = $1`, [shift.id]);
                 return res.json({ action: 'ask_photo', text: '🏁 <b>Завершение смены:</b>\nПришлите фото НАКЛАДНОЙ.', user });
             }
-            await client.query(`UPDATE shifts SET status = 'finished', end_time = NOW() WHERE id = $1`, [shift.id]);
+            await client.query(`UPDATE shifts SET status = 'finished', end_time = NOW(), invoice_requested_at = NULL WHERE id = $1`, [shift.id]);
             return res.json({ action: 'status', text: '🏁 Смена успешно закрыта!', user });
         }
 
-        // --- 4. РОУТИНГ КОМАНД (С блокировкой дублей) ---
+        // --- 4. РОУТИНГ ---
         let action = 'show_driver_menu';
-        let responseText = 'Выберите действие:';
-
         if (cmd === '/start_shift') {
-            const activeShift = await client.query(`SELECT id, status FROM shifts WHERE user_id = $1 AND status != 'finished' LIMIT 1`, [user.id]);
-            if (activeShift.rows.length > 0) {
-                return res.json({ action: 'status', text: '⚠️ У вас уже есть открытая смена или черновик. Нельзя начать новую, пока не закроете старую.', user });
-            }
+            const activeShift = await client.query(`SELECT id FROM shifts WHERE user_id = $1 AND status != 'finished' LIMIT 1`, [user.id]);
+            if (activeShift.rows.length > 0) return res.json({ action: 'status', text: '⚠️ Смена уже открыта. Сначала завершите её.', user });
             await client.query(`INSERT INTO shifts (user_id, tenant_id, status) VALUES ($1, $2, 'pending_truck')`, [user.id, user.tenant_id]);
             action = 'start_shift';
         } else if (cmd === '/status') action = 'status';
         else if (cmd === '/driver') action = 'show_driver_menu';
         else if (cmd === '/admin' && user.role === 'admin') action = 'show_admin_menu';
 
-        return res.json({ action, text: responseText, user });
+        return res.json({ action, text: 'Выберите действие:', user });
 
     } catch (e) {
-        console.error('Fatal Webhook Error:', e);
-        res.status(500).json({ error: 'Internal Server Error' });
+        console.error(e);
+        res.status(500).json({ error: 'Server Error' });
     } finally { client.release(); }
 });
 
