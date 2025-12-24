@@ -69,7 +69,9 @@ const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunc
 // 1. ФАЙЛЫ
 app.post('/api/upload', authenticateToken, upload.single('file'), (req: any, res: Response) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    res.json({ url: `/uploads/${req.file.filename}` });
+    // Возвращаем относительный путь, который будет храниться в БД
+    const fileUrl = `/uploads/${req.file.filename}`;
+    res.json({ url: fileUrl });
 });
 
 // 2. АВТОРИЗАЦИЯ
