@@ -14,18 +14,33 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'secret';
-const UPLOAD_DIR = process.env.UPLOAD_DIR || '/app/uploads';
+
+// ПУТЬ К ВАШЕЙ ПАПКЕ (Если в докере - это путь ВНУТРИ контейнера)
+const UPLOAD_DIR = '/app/uploads'; 
 
 // --- БЛОК 1: ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ---
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// --- БЛОК 2: НАСТРОЙКА ЗАГРУЗКИ ФАЙЛОВ (MULTER) ---
-if (!fs.existsSync(UPLOAD_DIR)) {
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
+// --- БЛОК 2: НАСТРОЙКА СИСТЕМНОГО ХРАНИЛИЩА (Multer) ---
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+    destination: (req: any, file, cb) => {
+        // Берем ID тенанта из авторизации (req.user заполнится в middleware)
+        const tenantId = req.user?.tenant_id || 'unknown';
+        const now = new Date();
+        const year = now.getFullYear().toString();
+        const month = (now.getMonth() + 1).toString().padStart(2, '0');
+
+        // Формируем путь: uploads/tenant_id/year/month
+        const finalDir = path.join(UPLOAD_DIR, tenantId.toString(), year, month);
+
+        // Создаем папки, если их нет
+        if (!fs.existsSync(finalDir)) {
+            fs.mkdirSync(finalDir, { recursive: true });
+        }
+        cb(null, finalDir);
+    },
     filename: (req, file, cb) => {
+        // Генерируем уникальное имя: время-рандом.расширение
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
         cb(null, uniqueSuffix + path.extname(file.originalname));
     }
@@ -36,7 +51,6 @@ app.use(cors());
 app.use(express.json());
 
 // --- БЛОК 3: ЗАЩИТА (MIDDLEWARE) ---
-// Проверяет либо API Key (от n8n), либо Token (от фронтенда)
 interface AuthRequest extends Request { user?: any; }
 const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunction) => {
     const apiKey = req.headers['x-api-key'] as string;
@@ -56,16 +70,19 @@ const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunc
     });
 };
 
-// --- БЛОК 4: API ДЛЯ ЗАГРУЗКИ ФОТО ---
-// n8n скачивает фото из ТГ и отправляет сюда
+// --- БЛОК 4: ЗАГРУЗКА ФОТО ---
 app.post('/api/upload', authenticateToken, upload.single('file'), (req: any, res: Response) => {
     if (!req.file) return res.status(400).json({ error: 'Файл не загружен' });
-    res.json({ url: `/uploads/${req.file.filename}` });
+    
+    // Возвращаем путь относительно корня uploads для сохранения в БД
+    // Например: /1/2025/12/12345.jpg
+    const relativePath = req.file.path.replace(UPLOAD_DIR, '');
+    res.json({ url: relativePath });
 });
 
-// --- БЛОК 5: ЛОГИКА СМЕН (SHIFTS) ---
+// --- БЛОК 5: ЛОГИКА СМЕН ---
 
-// 5.1 Получить текущую смену (активную или черновик)
+// 5.1 Текущая смена
 app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: Response) => {
     const targetUserId = req.user.role === 'system' ? req.query.user_id : req.user.id;
     const sql = `
@@ -82,7 +99,7 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
     res.json(result.rows[0] || null);
 });
 
-// 5.2 Сохранить ID сообщения меню (Чистый чат)
+// 5.2 Чистый чат
 app.post('/api/users/set-menu-id', authenticateToken, async (req: AuthRequest, res: Response) => {
     const { message_id, user_id: bodyUserId } = req.body;
     const userId = req.user.role === 'system' ? bodyUserId : req.user.id;
@@ -90,15 +107,14 @@ app.post('/api/users/set-menu-id', authenticateToken, async (req: AuthRequest, r
     res.json({ success: true });
 });
 
-// --- БЛОК 6: ГЛАВНЫЙ ОБРАБОТЧИК (WEBHOOK ДЛЯ N8N) ---
+// --- БЛОК 6: ГЛАВНЫЙ ОБРАБОТЧИК (WEBHOOK) ---
 app.post('/api/integrations/telegram/webhook', async (req: Request, res: Response) => {
-    const { id: tgId, text, photo_url, mileage } = req.body;
+    const { id: tgId, text, photo_url } = req.body;
     const client = await pool.connect();
 
     try {
-        // 1. Ищем пользователя
         const userRes = await client.query(`
-            SELECT u.*, t.timezone, t.invoice_required 
+            SELECT u.*, t.timezone, t.invoice_required as tenant_invoice_required 
             FROM users u LEFT JOIN tenants t ON u.tenant_id = t.id
             WHERE u.telegram_user_id = $1`, [tgId]);
         
@@ -106,71 +122,95 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
         const user = userRes.rows[0];
         await client.query(`SELECT set_config('audit.user_id', $1, true)`, [user.id.toString()]);
 
-        const cmd = (text || '').split(' ')[0];
+        const cmdText = (text || '').trim();
+        const cmd = cmdText.split(' ')[0];
 
-        // --- ЛОГИКА: ОБРАБОТКА ЗАГРУЖЕННОГО ФОТО ---
+        // 6.1 ОБРАБОТКА ФОТО (Накладные / Одометры)
         if (text === 'PHOTO_UPLOADED') {
-            const shiftRes = await client.query(`SELECT * FROM shifts WHERE user_id = $1 AND status != 'finished' LIMIT 1`, [user.id]);
+            const shiftRes = await client.query(`
+                SELECT s.*, st.odometer_required 
+                FROM shifts s LEFT JOIN dict_sites st ON s.site_id = st.id 
+                WHERE s.user_id = $1 AND s.status != 'finished' LIMIT 1`, [user.id]);
             const shift = shiftRes.rows[0];
-            if (!shift) return res.json({ action: 'show_driver_menu', text: 'Смена не найдена.' });
+            if (!shift) return res.json({ action: 'show_driver_menu', text: 'Смена не найдена.', user });
 
-            if (shift.status === 'pending_invoice') {
-                // Это фото накладной -> Закрываем смену
-                await client.query(`UPDATE shifts SET photo_end_url = $1, status = 'finished' WHERE id = $2`, [photo_url, shift.id]);
-                return res.json({ action: 'status', text: '✅ Накладная принята. Смена закрыта!', user });
-            } else {
-                // Это фото одометра -> Просто сохраняем ссылку
+            // А. Одометр СТАРТ
+            if (shift.status === 'active' && shift.odometer_required && !shift.photo_start_url) {
                 await client.query(`UPDATE shifts SET photo_start_url = $1 WHERE id = $2`, [photo_url, shift.id]);
-                return res.json({ action: 'status', text: '📸 Фото одометра сохранено.', user });
+                return res.json({ action: 'status', text: '📸 Фото одометра (старт) принято!', user });
+            }
+            // Б. Одометр ФИНИШ
+            if (shift.status === 'active' && shift.odometer_required && shift.photo_start_url && !shift.photo_end_url) {
+                await client.query(`UPDATE shifts SET photo_end_url = $1 WHERE id = $2`, [photo_url, shift.id]);
+                if (user.tenant_invoice_required) {
+                    await client.query(`UPDATE shifts SET status = 'pending_invoice' WHERE id = $1`, [shift.id]);
+                    return res.json({ action: 'ask_photo', text: '✅ Одометр принят. Пришлите фото НАКЛАДНОЙ.', user });
+                } else {
+                    await client.query(`UPDATE shifts SET status = 'finished', end_time = NOW() WHERE id = $1`, [shift.id]);
+                    return res.json({ action: 'status', text: '🏁 Смена завершена!', user });
+                }
+            }
+            // В. НАКЛАДНАЯ
+            if (shift.status === 'pending_invoice') {
+                await client.query(`UPDATE shifts SET photo_end_url = COALESCE(photo_end_url, $1), status = 'finished', end_time = NOW() WHERE id = $2`, [photo_url, shift.id]);
+                return res.json({ action: 'status', text: '✅ Накладная принята. Смена закрыта!', user });
             }
         }
 
-        // --- ЛОГИКА: ВЫБОР МАШИНЫ ---
-        const truckMatch = cmd.match(/\/select_truck_(\d+)/);
-        if (truckMatch) {
-            await client.query(`UPDATE shifts SET truck_id = $1, status = 'pending_site' WHERE user_id = $2 AND status = 'pending_truck'`, [truckMatch[1], user.id]);
-            return res.json({ action: 'select_site', text: 'Машина выбрана. Теперь укажите объект:', user });
-        }
-
-        // --- ЛОГИКА: ВЫБОР ОБЪЕКТА + ПРОВЕРКА ОДОМЕТРА ---
-        const siteMatch = cmd.match(/\/select_site_(\d+)/);
+        // 6.2 ВЫБОР ОБЪЕКТА (СТАРТ)
+        const siteMatch = cmdText.match(/\/select_site_(\d+)/);
         if (siteMatch) {
             const siteId = siteMatch[1];
             const siteInfo = await client.query(`SELECT odometer_required FROM dict_sites WHERE id = $1`, [siteId]);
-            
             await client.query(`UPDATE shifts SET site_id = $1, status = 'active', start_time = NOW() WHERE user_id = $2 AND status = 'pending_site'`, [siteId, user.id]);
-            
-            // Если объект требует одометр — просим фото
             if (siteInfo.rows[0]?.odometer_required) {
-                return res.json({ action: 'ask_photo', text: '📸 Объект требует фото одометра. Пришлите его сейчас.', user });
+                return res.json({ action: 'ask_photo', text: '📸 Объект требует фото одометра. Пришлите его.', user });
             }
             return res.json({ action: 'status', text: '🚀 Смена открыта!', user });
         }
 
-        // --- ЛОГИКА: ЗАВЕРШЕНИЕ СМЕНЫ ---
-        if (cmd === '/end_shift_now' || (text && !text.startsWith('/'))) {
-            const comment = text.startsWith('/') ? null : text;
-            const updateRes = await client.query(
-                `UPDATE shifts SET end_time = NOW(), status = 'pending_invoice', comment = $1 
-                 WHERE user_id = $2 AND status = 'active' RETURNING id`, [comment, user.id]);
-            
-            if (updateRes.rows.length > 0) {
-                return res.json({ action: 'status', text: '✅ Смена зафиксирована. Ждем фото накладной.', user });
-            }
+        // 6.3 ВЫБОР МАШИНЫ
+        const truckMatch = cmdText.match(/\/select_truck_(\d+)/);
+        if (truckMatch) {
+            await client.query(`UPDATE shifts SET truck_id = $1, status = 'pending_site' WHERE user_id = $2 AND status = 'pending_truck'`, [truckMatch[1], user.id]);
+            return res.json({ action: 'select_site', text: 'Теперь укажите объект:', user });
         }
 
-        // --- СТАНДАРТНЫЙ РОУТИНГ ---
+        // 6.4 ЗАВЕРШЕНИЕ СМЕНЫ (Команда или Комментарий)
+        if (cmd === '/end_shift' || cmd === '/end_shift_now' || (cmdText && !cmdText.startsWith('/'))) {
+            const shiftRes = await client.query(`SELECT s.*, st.odometer_required FROM shifts s LEFT JOIN dict_sites st ON s.site_id = st.id WHERE s.user_id = $1 AND s.status = 'active' LIMIT 1`, [user.id]);
+            const shift = shiftRes.rows[0];
+
+            if (!shift) {
+                if (cmdText.startsWith('/')) return res.json({ action: 'status', text: 'Активной смены нет.', user });
+                return res.json({ action: 'show_driver_menu', text: 'Меню', user });
+            }
+
+            const comment = cmdText.startsWith('/') ? null : cmdText;
+            await client.query(`UPDATE shifts SET comment = $1 WHERE id = $2`, [comment, shift.id]);
+
+            if (shift.odometer_required && !shift.photo_end_url) {
+                return res.json({ action: 'ask_photo', text: '📸 Для закрытия нужно фото одометра. Пришлите его.', user });
+            }
+            if (user.tenant_invoice_required) {
+                await client.query(`UPDATE shifts SET status = 'pending_invoice' WHERE id = $1`, [shift.id]);
+                return res.json({ action: 'ask_photo', text: '🏁 Пришлите фото НАКЛАДНОЙ.', user });
+            }
+            await client.query(`UPDATE shifts SET status = 'finished', end_time = NOW() WHERE id = $1`, [shift.id]);
+            return res.json({ action: 'status', text: '🏁 Смена закрыта!', user });
+        }
+
+        // 6.5 РОУТИНГ КОМАНД
         let action = 'show_driver_menu';
         if (cmd === '/start_shift') {
             const hasShift = await client.query(`SELECT id FROM shifts WHERE user_id = $1 AND status != 'finished'`, [user.id]);
-            if (hasShift.rows.length === 0) {
-                await client.query(`INSERT INTO shifts (user_id, tenant_id, status) VALUES ($1, $2, 'pending_truck')`, [user.id, user.tenant_id]);
-            }
+            if (hasShift.rows.length === 0) await client.query(`INSERT INTO shifts (user_id, tenant_id, status) VALUES ($1, $2, 'pending_truck')`, [user.id, user.tenant_id]);
             action = 'start_shift';
         } else if (cmd === '/status') action = 'status';
-        else if (cmd === '/end_shift') action = 'end_shift';
+        else if (cmd === '/driver') action = 'show_driver_menu';
+        else if (cmd === '/admin' && user.role === 'admin') action = 'show_admin_menu';
 
-        return res.json({ action, text: `Меню`, user });
+        return res.json({ action, text: 'Меню', user });
 
     } catch (e) {
         console.error(e);
@@ -180,4 +220,4 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
     }
 });
 
-app.listen(PORT, () => console.log(`Сервер запущен на порту ${PORT}`));
+app.listen(PORT, () => console.log(`API на порту ${PORT}`));
