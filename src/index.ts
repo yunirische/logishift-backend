@@ -11,7 +11,6 @@ import * as crypto from 'crypto';
 
 dotenv.config();
 
-// --- КОНФИГУРАЦИЯ ---
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'secret';
@@ -20,7 +19,7 @@ const CDN_URL = 'https://bot.kontrolsmen.ru/uploads';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// --- НАСТРОЙКА СИСТЕМНОГО ХРАНИЛИЩА ---
+// --- ХРАНИЛИЩЕ ---
 const storage = multer.diskStorage({
     destination: (req: any, file, cb) => {
         const tenantId = req.user?.tenant_id || 'unknown';
@@ -39,7 +38,7 @@ const upload = multer({ storage: storage });
 app.use(cors());
 app.use(express.json());
 
-// --- ЗАЩИТА (API KEY / JWT) ---
+// --- ЗАЩИТА ---
 interface AuthRequest extends Request { user?: any; }
 const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunction) => {
     const apiKey = req.headers['x-api-key'] as string;
@@ -61,7 +60,7 @@ const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunc
     });
 };
 
-// --- ВСПОМОГАТЕЛЬНАЯ ЛОГИКА ---
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 async function finalizeShift(client: any, shiftId: number) {
     await client.query(`
         UPDATE shifts 
@@ -70,19 +69,7 @@ async function finalizeShift(client: any, shiftId: number) {
         WHERE id = $1`, [shiftId]);
 }
 
-// --- ОБЩИЕ МЕТОДЫ API ---
-
-app.post('/api/auth/login', async (req: Request, res: Response) => {
-    const { login, password } = req.body;
-    const result = await pool.query('SELECT * FROM users WHERE login = $1', [login]);
-    if (result.rows.length === 0) return res.status(401).json({ error: 'User not found' });
-    const user = result.rows[0];
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Invalid password' });
-    const token = jwt.sign({ id: user.id, role: user.role, tenant_id: user.tenant_id }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ token, user: { id: user.id, full_name: user.full_name, role: user.role } });
-});
-
+// --- СПРАВОЧНИКИ ---
 app.get('/api/trucks', authenticateToken, async (req: AuthRequest, res: Response) => {
     const tId = req.user.role === 'system' ? req.query.tenant_id : req.user.tenant_id;
     const result = await pool.query('SELECT * FROM dict_trucks WHERE tenant_id = $1 AND is_active = true ORDER BY name', [tId]);
@@ -130,15 +117,20 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
     res.json(shift || null);
 });
 
-// --- ГЛАВНЫЙ ОБРАБОТЧИК (WEBHOOK) ---
-
+// --- ГЛАВНЫЙ WEBHOOK ---
 app.post('/api/integrations/telegram/webhook', async (req: Request, res: Response) => {
-    const { id: tgId, photo_url, username, first_name, last_name } = req.body;
+    const { id: tgId, photo_url } = req.body;
     let rawText = (req.body.text || '').trim();
+    
+    // ФИКС ДЛЯ n8n: Если текст пустой, но есть объект data (нажата кнопка)
+    if (!rawText && req.body.data) {
+        rawText = typeof req.body.data === 'string' ? req.body.data : JSON.stringify(req.body.data);
+    }
+
     const client = await pool.connect();
 
     try {
-        // 1. НОРМАЛИЗАЦИЯ КОМАНД (Telegram / JSON / Protocol)
+        // 1. НОРМАЛИЗАЦИЯ КОМАНД
         let internalCmd = rawText.toUpperCase();
         let paramId: string | null = null;
 
@@ -147,48 +139,22 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
                 const json = JSON.parse(rawText);
                 if (json.intent === 'add_truck') { internalCmd = 'TRK'; paramId = json.truck_id.toString(); }
                 if (json.intent === 'add_site') { internalCmd = 'STE'; paramId = json.site_id.toString(); }
+                if (json.data && json.data.adm === 'end_shift_now') { internalCmd = 'END_SHIFT_NOW'; }
             } catch (e) {}
         } else if (rawText.startsWith('/')) {
             const clean = rawText.substring(1).toUpperCase();
             if (clean.includes('SELECT_TRUCK_')) { internalCmd = 'TRK'; paramId = clean.replace('SELECT_TRUCK_', ''); }
             else if (clean.includes('SELECT_SITE_')) { internalCmd = 'STE'; paramId = clean.replace('SELECT_SITE_', ''); }
             else internalCmd = clean;
-        } else if (rawText.includes(':')) {
-            const parts = rawText.split(':');
-            internalCmd = parts[0].toUpperCase();
-            paramId = parts[1];
         }
 
-        // 2. ПОИСК ИЛИ РЕГИСТРАЦИЯ ЮЗЕРА
+        // 2. ПОИСК ЮЗЕРА
         const userRes = await client.query(`
             SELECT u.*, t.timezone, t.invoice_required as tenant_invoice_required 
             FROM users u LEFT JOIN tenants t ON u.tenant_id = t.id
             WHERE u.telegram_user_id = $1`, [tgId]);
         
-        if (userRes.rows.length === 0) {
-            const fullName = [first_name, last_name].filter(Boolean).join(' ') || username || 'Unknown';
-            const login = username || `tg_${tgId}`;
-            const inviteMatch = rawText.match(/^\/start\s+(.+)$/);
-
-            if (inviteMatch) {
-                const inv = await client.query(`SELECT * FROM invites WHERE code = $1 AND status = 'pending' AND expires_at > NOW()`, [inviteMatch[1]]);
-                if (inv.rows.length === 0) return res.json({ action: 'ask_invite', text: 'Код недействителен.' });
-                await client.query('BEGIN');
-                const newUser = await client.query(`INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active) VALUES ($1, $2, 'driver', $3, $4, '123456', true) RETURNING *`, [tgId, fullName, inv.rows[0].tenant_id, login]);
-                await client.query(`UPDATE invites SET status = 'used' WHERE id = $1`, [inv.rows[0].id]);
-                await client.query('COMMIT');
-                return res.json({ action: 'show_driver_menu', text: 'Регистрация успешна!', user: newUser.rows[0] });
-            } else {
-                await client.query('BEGIN');
-                const apiKey = crypto.randomBytes(32).toString('hex');
-                const tenantRes = await client.query(`INSERT INTO tenants (name, plan_id, is_active, api_key) VALUES ($1, 1, true, $2) RETURNING id`, [`Компания ${fullName}`, apiKey]);
-                const adminUser = await client.query(`INSERT INTO users (telegram_user_id, full_name, role, tenant_id, login, password_hash, is_active) VALUES ($1, $2, 'admin', $3, $4, 'admin123', true) RETURNING *`, [tgId, fullName, tenantRes.rows[0].id, login]);
-                await client.query(`UPDATE tenants SET owner_user_id = $1 WHERE id = $2`, [tgId, tenantRes.rows[0].id]);
-                await client.query('COMMIT');
-                return res.json({ action: 'show_admin_menu', text: 'Компания создана!', user: adminUser.rows[0], api_key: apiKey });
-            }
-        }
-
+        if (userRes.rows.length === 0) return res.json({ action: 'ask_invite', text: 'Зарегистрируйтесь.' });
         const user = userRes.rows[0];
         await client.query(`SELECT set_config('audit.user_id', $1, true)`, [user.id.toString()]);
 
@@ -198,12 +164,12 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
             const shift = shiftRes.rows[0];
             if (!shift) return res.json({ action: 'show_driver_menu', text: '⚠️ Смена не найдена.', user });
 
-            if (shift.invoice_requested_at) {
+            if (shift.invoice_requested_at) { // Процесс финиша
                 if (shift.odometer_required && !shift.photo_end_url) {
                     await client.query(`UPDATE shifts SET photo_end_url = $1 WHERE id = $2`, [photo_url, shift.id]);
                     if (user.tenant_invoice_required) {
                         await client.query(`UPDATE shifts SET status = 'pending_invoice' WHERE id = $1`, [shift.id]);
-                        return res.json({ action: 'ask_photo', text: '📸 Одометр принят. Теперь пришлите фото НАКЛАДНОЙ.', user });
+                        return res.json({ action: 'ask_photo', text: '✅ Одометр принят. Теперь пришлите фото НАКЛАДНОЙ.', user });
                     }
                     await finalizeShift(client, shift.id);
                     return res.json({ action: 'status', text: '🏁 Смена завершена!', user });
@@ -213,38 +179,43 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
                     await finalizeShift(client, shift.id);
                     return res.json({ action: 'status', text: '✅ Накладная принята! Смена закрыта.', user });
                 }
-            } else {
+            } else { // Процесс старта
                 await client.query(`UPDATE shifts SET photo_start_url = $1 WHERE id = $2`, [photo_url, shift.id]);
-                return res.json({ action: 'status', text: '✅ Фото одометра (старт) принято!', user });
+                return res.json({ action: 'status', text: '✅ Фото одометра принято! Хорошего пути.', user });
             }
         }
 
         // 4. ВЫБОР МАШИНЫ / ОБЪЕКТА
         if (internalCmd === 'TRK' && paramId) {
             await client.query(`UPDATE shifts SET truck_id = $1, status = 'pending_site' WHERE user_id = $2 AND status = 'pending_truck'`, [paramId, user.id]);
-            return res.json({ action: 'select_site', text: '🚚 Машина выбрана. Теперь укажите объект:', user });
+            return res.json({ action: 'select_site', text: '🚚 Машина выбрана. Теперь выберите объект:', user });
         }
         if (internalCmd === 'STE' && paramId) {
-            const siteInfo = await client.query(`SELECT odometer_required FROM dict_sites WHERE id = $1`, [paramId]);
+            const siteInfo = await client.query(`SELECT name, odometer_required FROM dict_sites WHERE id = $1`, [paramId]);
             await client.query(`UPDATE shifts SET site_id = $1, status = 'active', start_time = NOW() WHERE user_id = $2 AND status = 'pending_site'`, [paramId, user.id]);
-            return res.json({ action: siteInfo.rows[0]?.odometer_required ? 'ask_photo' : 'status', text: siteInfo.rows[0]?.odometer_required ? '📸 Пришлите фото одометра.' : '🚀 Смена открыта!', user });
+            const odoMsg = siteInfo.rows[0]?.odometer_required ? '\n\n📸 <b>Внимание:</b> Объект требует фото одометра. Пришлите его прямо сейчас.' : '';
+            return res.json({ action: siteInfo.rows[0]?.odometer_required ? 'ask_photo' : 'status', text: `🚀 Смена открыта на объекте ${siteInfo.rows[0].name}!${odoMsg}`, user });
         }
 
         // 5. ЗАВЕРШЕНИЕ / ОТМЕНА
-        if (internalCmd === 'CANCEL') {
+        if (internalCmd === 'CANCEL_SHIFT') {
             await client.query(`DELETE FROM shifts WHERE user_id = $1 AND status IN ('pending_truck', 'pending_site')`, [user.id]);
             return res.json({ action: 'show_driver_menu', text: '❌ Черновик удален.', user });
         }
 
-        if (internalCmd === 'END_SHIFT' || internalCmd === 'END_SHIFT_NOW' || (rawText && !rawText.startsWith('/') && !rawText.includes(':'))) {
+        if (internalCmd === 'END_SHIFT' || internalCmd === 'END_SHIFT_NOW' || (rawText && !rawText.startsWith('/') && !rawText.includes('{'))) {
             const shiftRes = await client.query(`SELECT s.*, st.odometer_required FROM shifts s LEFT JOIN dict_sites st ON s.site_id = st.id WHERE s.user_id = $1 AND s.status = 'active' LIMIT 1`, [user.id]);
             const shift = shiftRes.rows[0];
+            
             if (!shift) {
-                const pend = await client.query(`SELECT id FROM shifts WHERE user_id = $1 AND status = 'pending_invoice'`, [user.id]);
-                return res.json({ action: pend.rows.length > 0 ? 'status' : 'show_driver_menu', text: pend.rows.length > 0 ? 'Ожидается накладная.' : 'Активной смены нет.', user });
+                const draft = await client.query(`SELECT status FROM shifts WHERE user_id = $1 AND status != 'finished' LIMIT 1`, [user.id]);
+                if (draft.rows.length > 0) return res.json({ action: 'status', text: '⚠️ У вас не завершено оформление смены. Продолжите выбор или отмените черновик.', user });
+                return res.json({ action: 'show_driver_menu', text: '❌ Активной смены нет.', user });
             }
+
             await client.query(`UPDATE shifts SET invoice_requested_at = NOW() WHERE id = $1`, [shift.id]);
-            if (!rawText.startsWith('/') && !rawText.includes(':')) await client.query(`UPDATE shifts SET comment = $1 WHERE id = $2`, [rawText, shift.id]);
+            if (!rawText.startsWith('/') && !rawText.includes('{')) await client.query(`UPDATE shifts SET comment = $1 WHERE id = $2`, [rawText, shift.id]);
+            
             if (shift.odometer_required && !shift.photo_end_url) return res.json({ action: 'ask_photo', text: '📸 Пришлите фото одометра (финиш).', user });
             if (user.tenant_invoice_required) {
                 await client.query(`UPDATE shifts SET status = 'pending_invoice' WHERE id = $1`, [shift.id]);
@@ -256,19 +227,21 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
 
         // 6. РОУТИНГ
         let action = 'show_driver_menu';
+        let respText = 'Выберите действие:';
+
         if (internalCmd === 'START_SHIFT') {
             const cur = await client.query(`SELECT id FROM shifts WHERE user_id = $1 AND status != 'finished' LIMIT 1`, [user.id]);
-            if (cur.rows.length > 0) return res.json({ action: 'status', text: '⚠️ Смена уже открыта.', user });
+            if (cur.rows.length > 0) return res.json({ action: 'status', text: '⚠️ У вас уже есть открытая смена или черновик.', user });
             await client.query(`INSERT INTO shifts (user_id, tenant_id, status) VALUES ($1, $2, 'pending_truck')`, [user.id, user.tenant_id]);
             action = 'start_shift';
         } else if (internalCmd === 'STATUS') action = 'status';
         else if (internalCmd === 'DRIVER') action = 'show_driver_menu';
         else if (internalCmd === 'ADMIN' && user.role === 'admin') action = 'show_admin_menu';
 
-        return res.json({ action, text: 'Выберите действие:', user });
+        return res.json({ action, text: respText, user });
 
     } catch (e) { console.error(e); res.status(500).json({ error: 'Server Error' }); }
     finally { client.release(); }
 });
 
-app.listen(PORT, () => console.log(`API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`API on ${PORT}`));
