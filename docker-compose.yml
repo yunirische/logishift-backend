@@ -12,6 +12,12 @@ services:
       - JWT_SECRET=mySu32perSecквафыirecячтKeyc322c3!
     networks:
       - smenabot_net
+
+    volumes:
+      # ВАЖНО: Связываем папку на сервере с папкой внутри контейнера
+      # Это тот же путь, который использует Caddy
+      - /opt/docker-data/static_files:/app/uploads
+      
     ports:
       - "3000:3000"
 
@@ -20,3 +26,4 @@ networks:
     external: true
     # ВОТ ЗДЕСЬ БЫЛА ОШИБКА. Должно быть тире, как на скриншоте Portainer:
     name: smenabot-net
+
