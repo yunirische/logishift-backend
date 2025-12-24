@@ -15,7 +15,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'secret';
 
-// ПУТЬ К ВАШЕЙ ПАПКЕ (Если в докере - это путь ВНУТРИ контейнера)
+// ПУТЬ К ВАШЕЙ ПАПКЕ
 const UPLOAD_DIR = '/app/uploads'; 
 
 // --- БЛОК 1: ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ---
@@ -24,23 +24,18 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 // --- БЛОК 2: НАСТРОЙКА СИСТЕМНОГО ХРАНИЛИЩА (Multer) ---
 const storage = multer.diskStorage({
     destination: (req: any, file, cb) => {
-        // Берем ID тенанта из авторизации (req.user заполнится в middleware)
         const tenantId = req.user?.tenant_id || 'unknown';
         const now = new Date();
         const year = now.getFullYear().toString();
         const month = (now.getMonth() + 1).toString().padStart(2, '0');
-
-        // Формируем путь: uploads/tenant_id/year/month
         const finalDir = path.join(UPLOAD_DIR, tenantId.toString(), year, month);
 
-        // Создаем папки, если их нет
         if (!fs.existsSync(finalDir)) {
             fs.mkdirSync(finalDir, { recursive: true });
         }
         cb(null, finalDir);
     },
     filename: (req, file, cb) => {
-        // Генерируем уникальное имя: время-рандом.расширение
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
         cb(null, uniqueSuffix + path.extname(file.originalname));
     }
@@ -70,17 +65,14 @@ const authenticateToken = async (req: AuthRequest, res: Response, next: NextFunc
     });
 };
 
-// --- БЛОК 4: ЗАГРУЗКА ФОТО ---
+// --- БЛОК 4: API ДЛЯ ЗАГРУЗКИ ФОТО ---
 app.post('/api/upload', authenticateToken, upload.single('file'), (req: any, res: Response) => {
     if (!req.file) return res.status(400).json({ error: 'Файл не загружен' });
-    
-    // Возвращаем путь относительно корня uploads для сохранения в БД
-    // Например: /1/2025/12/12345.jpg
     const relativePath = req.file.path.replace(UPLOAD_DIR, '');
     res.json({ url: relativePath });
 });
 
-// --- БЛОК 5: ЛОГИКА СМЕН ---
+// --- БЛОК 5: ЛОГИКА ДАННЫХ (SHIFTS & DICTS) ---
 
 // 5.1 Текущая смена
 app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: Response) => {
@@ -99,12 +91,36 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
     res.json(result.rows[0] || null);
 });
 
-// 5.2 Чистый чат
+// 5.2 Сохранить ID сообщения меню (Чистый чат)
 app.post('/api/users/set-menu-id', authenticateToken, async (req: AuthRequest, res: Response) => {
     const { message_id, user_id: bodyUserId } = req.body;
     const userId = req.user.role === 'system' ? bodyUserId : req.user.id;
     await pool.query('UPDATE users SET last_menu_message_id = $1 WHERE id = $2', [message_id, userId]);
     res.json({ success: true });
+});
+
+// 5.3 Список машин (ДЛЯ n8n)
+app.get('/api/trucks', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const tenantId = req.user.role === 'system' ? req.query.tenant_id : req.user.tenant_id;
+        const result = await pool.query(
+            'SELECT * FROM dict_trucks WHERE tenant_id = $1 AND is_active = true ORDER BY name', 
+            [tenantId]
+        );
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: 'Database error' }); }
+});
+
+// 5.4 Список объектов (ДЛЯ n8n)
+app.get('/api/sites', authenticateToken, async (req: AuthRequest, res: Response) => {
+    try {
+        const tenantId = req.user.role === 'system' ? req.query.tenant_id : req.user.tenant_id;
+        const result = await pool.query(
+            'SELECT * FROM dict_sites WHERE tenant_id = $1 AND is_active = true ORDER BY name', 
+            [tenantId]
+        );
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: 'Database error' }); }
 });
 
 // --- БЛОК 6: ГЛАВНЫЙ ОБРАБОТЧИК (WEBHOOK) ---
@@ -134,12 +150,10 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
             const shift = shiftRes.rows[0];
             if (!shift) return res.json({ action: 'show_driver_menu', text: 'Смена не найдена.', user });
 
-            // А. Одометр СТАРТ
             if (shift.status === 'active' && shift.odometer_required && !shift.photo_start_url) {
                 await client.query(`UPDATE shifts SET photo_start_url = $1 WHERE id = $2`, [photo_url, shift.id]);
                 return res.json({ action: 'status', text: '📸 Фото одометра (старт) принято!', user });
             }
-            // Б. Одометр ФИНИШ
             if (shift.status === 'active' && shift.odometer_required && shift.photo_start_url && !shift.photo_end_url) {
                 await client.query(`UPDATE shifts SET photo_end_url = $1 WHERE id = $2`, [photo_url, shift.id]);
                 if (user.tenant_invoice_required) {
@@ -150,7 +164,6 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
                     return res.json({ action: 'status', text: '🏁 Смена завершена!', user });
                 }
             }
-            // В. НАКЛАДНАЯ
             if (shift.status === 'pending_invoice') {
                 await client.query(`UPDATE shifts SET photo_end_url = COALESCE(photo_end_url, $1), status = 'finished', end_time = NOW() WHERE id = $2`, [photo_url, shift.id]);
                 return res.json({ action: 'status', text: '✅ Накладная принята. Смена закрыта!', user });
@@ -176,7 +189,7 @@ app.post('/api/integrations/telegram/webhook', async (req: Request, res: Respons
             return res.json({ action: 'select_site', text: 'Теперь укажите объект:', user });
         }
 
-        // 6.4 ЗАВЕРШЕНИЕ СМЕНЫ (Команда или Комментарий)
+        // 6.4 ЗАВЕРШЕНИЕ СМЕНЫ
         if (cmd === '/end_shift' || cmd === '/end_shift_now' || (cmdText && !cmdText.startsWith('/'))) {
             const shiftRes = await client.query(`SELECT s.*, st.odometer_required FROM shifts s LEFT JOIN dict_sites st ON s.site_id = st.id WHERE s.user_id = $1 AND s.status = 'active' LIMIT 1`, [user.id]);
             const shift = shiftRes.rows[0];
