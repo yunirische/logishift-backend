@@ -74,9 +74,13 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req: any, res
 
 // --- БЛОК 5: ЛОГИКА ДАННЫХ (SHIFTS & DICTS) ---
 
-// 5.1 Текущая смена
+// 5.1 Текущая смена (с полными ссылками на фото)
 app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: Response) => {
     const targetUserId = req.user.role === 'system' ? req.query.user_id : req.user.id;
+    
+    // Укажи здесь свой домен, где лежат файлы
+    const CDN_URL = 'https://bot.kontrolsmen.ru/uploads'; 
+
     const sql = `
         SELECT s.*, t.name as truck_name, t.plate as truck_plate, 
                st.name as site_name, st.odometer_required as site_odometer_required,
@@ -87,8 +91,17 @@ app.get('/api/shifts/current', authenticateToken, async (req: AuthRequest, res: 
         LEFT JOIN tenants ten ON s.tenant_id = ten.id
         WHERE s.user_id = $1 AND s.status != 'finished'
         ORDER BY s.id DESC LIMIT 1`;
+        
     const result = await pool.query(sql, [targetUserId]);
-    res.json(result.rows[0] || null);
+    const shift = result.rows[0];
+
+    if (shift) {
+        // Если фото есть, приклеиваем домен
+        if (shift.photo_start_url) shift.photo_start_url = `${CDN_URL}${shift.photo_start_url}`;
+        if (shift.photo_end_url) shift.photo_end_url = `${CDN_URL}${shift.photo_end_url}`;
+    }
+
+    res.json(shift || null);
 });
 
 // 5.2 Сохранить ID сообщения меню (Чистый чат)
