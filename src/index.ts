@@ -9,6 +9,17 @@ import cors from 'cors';
 import axios from 'axios';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+declare global {
+  namespace Express {
+    interface Request {
+      user?: {
+        id: number;
+        tenant_id: number;
+        role: string;
+      };
+    }
+  }
+}
 
 dotenv.config();
 
