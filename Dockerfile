@@ -1,14 +1,25 @@
-FROM node:18-alpine AS builder
+FROM node:20-alpine
+
 WORKDIR /app
+
+# Сначала копируем файлы зависимостей
 COPY package*.json ./
+COPY tsconfig.json ./
+
+# Устанавливаем зависимости
 RUN npm install
-COPY . .
+
+# Копируем схему Prisma и генерируем клиент (КРИТИЧНО)
+COPY prisma ./prisma/
+RUN npx prisma generate
+
+# Копируем исходный код
+COPY src ./src/
+
+# Собираем проект
 RUN npm run build
 
-FROM node:18-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install --production
-COPY --from=builder /app/dist ./dist
 EXPOSE 3000
+
+# Запуск из папки dist (куда tsc положит результат)
 CMD ["node", "dist/index.js"]
