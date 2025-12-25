@@ -5,7 +5,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  url      = env("postgres://your_app_user:OQ4kktp-Ht5n@postgres_app:5432/smenabot_db")
 }
 
 model plans {
