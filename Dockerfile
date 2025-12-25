@@ -1,29 +1,30 @@
 FROM node:20-alpine
 
-# Устанавливаем системные зависимости для Prisma
+# Устанавливаем системные библиотеки для Prisma
 RUN apk add --no-cache openssl libc6-compat
 
 WORKDIR /app
 
-# Сначала копируем файлы зависимостей
+# Копируем файлы зависимостей
 COPY package*.json ./
 COPY tsconfig.json ./
 
 # Устанавливаем зависимости
 RUN npm install
 
-# Копируем схему Prisma и генерируем клиент (КРИТИЧНО)
+# Копируем схему Prisma
 COPY prisma ./prisma/
-RUN npx prisma generate
+
+# Генерируем клиент Prisma (используем dummy URL для этапа билда)
+RUN DATABASE_URL="postgresql://unused:unused@localhost:5432/unused" npx prisma generate
 
 # Копируем исходный код
 COPY src ./src/
 
-# Собираем проект
+# Собираем TypeScript
 RUN npm run build
 
 EXPOSE 3000
 
-# Запуск из папки dist (куда tsc положит результат)
+# Запуск
 CMD ["node", "dist/index.js"]
-
