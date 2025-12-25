@@ -1,5 +1,8 @@
 FROM node:20-alpine
 
+# Устанавливаем системные зависимости для Prisma
+RUN apk add --no-cache openssl libc6-compat
+
 WORKDIR /app
 
 # Сначала копируем файлы зависимостей
@@ -23,3 +26,4 @@ EXPOSE 3000
 
 # Запуск из папки dist (куда tsc положит результат)
 CMD ["node", "dist/index.js"]
+
