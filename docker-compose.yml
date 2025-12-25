@@ -7,23 +7,16 @@ services:
     restart: always
     environment:
       - PORT=3000
-      # Твои данные (я их скрыл звездочками, но ты оставь как было у тебя с реальным паролем!)
-      - DATABASE_URL=postgres://your_app_user:OQ4kktp-Ht5n@postgres_app:5432/smenabot_db
-      - JWT_SECRET=mySu32perSecквафыirecячтKeyc322c3!
+      - DATABASE_URL=postgresql://user:password@host:5432/db_name
+      - JWT_SECRET=your_secret_key
     networks:
       - smenabot_net
-
     volumes:
-      # ВАЖНО: Связываем папку на сервере с папкой внутри контейнера
-      # Это тот же путь, который использует Caddy
       - /opt/docker-data/static_files:/app/uploads
-      
     ports:
       - "3000:3000"
 
 networks:
   smenabot_net:
     external: true
-    # ВОТ ЗДЕСЬ БЫЛА ОШИБКА. Должно быть тире, как на скриншоте Portainer:
     name: smenabot-net
-
