@@ -1,6 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { PrismaClient } from '@prisma/client';
-import multer from 'multer';
 import path from 'path';
 import fs from 'fs/promises';
 import { existsSync } from 'fs';
@@ -10,43 +9,38 @@ import axios from 'axios';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 
-// Расширяем типы Express для работы с JWT
-declare global {
-  namespace Express {
-    interface Request {
-      user?: {
-        id: number;
-        tenant_id: number;
-        role: string;
-      };
-    }
-  }
-}
-
 dotenv.config();
 
-// --- 1. ГЛОБАЛЬНЫЕ ПАТЧИ ---
+// --- 1. ГЛОБАЛЬНЫЕ ПАТЧИ (BigInt serialization) ---
 (BigInt.prototype as any).toJSON = function () {
   return this.toString();
 };
 
-// --- 2. КОНФИГУРАЦИЯ ---
+// --- 2. ИНИЦИАЛИЗАЦИЯ ---
 const prisma = new PrismaClient();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './uploads';
-const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-key';
+const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-change-me';
 const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 app.use(cors());
 app.use(express.json());
-// Делаем папку с фото доступной извне
 app.use('/uploads', express.static(UPLOAD_DIR));
+
+// Расширение типов для Express
+declare global {
+  namespace Express {
+    interface Request {
+      user?: { id: number; tenant_id: number; role: string };
+    }
+  }
+}
 
 // --- 3. UTILS ---
 const parseId = (id: any): number => {
   const parsed = parseInt(id);
-  if (isNaN(parsed)) throw new Error('Некорректный формат ID');
+  if (isNaN(parsed)) throw new Error('Invalid ID format');
   return parsed;
 };
 
@@ -58,7 +52,7 @@ const formatInTimezone = (date: Date | null, timezone: string = 'Europe/Moscow')
   });
 };
 
-const authenticateJWT = (req: any, res: Response, next: NextFunction) => {
+const authenticateJWT = (req: Request, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
   if (authHeader) {
     const token = authHeader.split(' ')[1];
@@ -76,35 +70,17 @@ const authenticateJWT = (req: any, res: Response, next: NextFunction) => {
 
 class MediaService {
   async downloadAndSave(fileId: string, tenantId: number): Promise<string> {
-    if (!TG_BOT_TOKEN) throw new Error('TG_BOT_TOKEN не настроен в .env');
-    
+    if (!TG_BOT_TOKEN) throw new Error('TG_BOT_TOKEN missing');
     const { data: fileData } = await axios.get(`https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile?file_id=${fileId}`);
     const filePath = fileData.result.file_path;
-    
     const now = new Date();
-    const relativeDir = path.join(
-      tenantId.toString(),
-      now.getFullYear().toString(),
-      (now.getMonth() + 1).toString().padStart(2, '0')
-    );
+    const relativeDir = path.join(tenantId.toString(), now.getFullYear().toString(), (now.getMonth() + 1).toString().padStart(2, '0'));
     const absoluteDir = path.join(UPLOAD_DIR, relativeDir);
-    
-    if (!existsSync(absoluteDir)) {
-      await fs.mkdir(absoluteDir, { recursive: true });
-    }
-
+    if (!existsSync(absoluteDir)) await fs.mkdir(absoluteDir, { recursive: true });
     const fileName = `${Date.now()}-${path.basename(filePath)}`;
-    const absolutePath = path.join(absoluteDir, fileName);
-    const dbPath = path.join(relativeDir, fileName);
-
-    const response = await axios({
-      method: 'GET',
-      url: `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${filePath}`,
-      responseType: 'arraybuffer'
-    });
-
-    await fs.writeFile(absolutePath, response.data);
-    return dbPath;
+    const response = await axios({ method: 'GET', url: `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${filePath}`, responseType: 'arraybuffer' });
+    await fs.writeFile(path.join(absoluteDir, fileName), response.data);
+    return path.join(relativeDir, fileName);
   }
 }
 
@@ -119,16 +95,8 @@ class ShiftService {
     return await prisma.$transaction(async (tx) => {
       const truck = await tx.dict_trucks.findUnique({ where: { id: truckId } });
       if (!truck || truck.is_busy || !truck.is_active) throw new Error('Машина занята или недоступна');
-
       await tx.dict_trucks.update({ where: { id: truckId }, data: { is_busy: true } });
-      await tx.shifts.create({
-        data: {
-          user_id: userId,
-          tenant_id: truck.tenant_id!,
-          truck_id: truckId,
-          status: 'pending_site'
-        }
-      });
+      await tx.shifts.create({ data: { user_id: userId, tenant_id: truck.tenant_id!, truck_id: truckId, status: 'pending_site' } });
       await tx.users.update({ where: { id: userId }, data: { current_state: 'pending_site' } });
     });
   }
@@ -137,30 +105,11 @@ class ShiftService {
     return await prisma.$transaction(async (tx) => {
       const site = await tx.dict_sites.findUnique({ where: { id: siteId } });
       const shift = await tx.shifts.findFirst({ where: { user_id: userId, status: 'pending_site' }, orderBy: { id: 'desc' } });
-      if (!site || !shift) throw new Error('Ошибка контекста выбора объекта');
-
-      const nextStatus = site.odometer_required ? 'awaiting_odo_start' : 'active';
-      await tx.shifts.update({
-        where: { id: shift.id },
-        data: { 
-          site_id: siteId, 
-          status: nextStatus,
-          start_time: nextStatus === 'active' ? new Date() : null 
-        }
-      });
-      await tx.users.update({ where: { id: userId }, data: { current_state: nextStatus } });
+      if (!site || !shift) throw new Error('Ошибка контекста');
+      const next = site.odometer_required ? 'awaiting_odo_start' : 'active';
+      await tx.shifts.update({ where: { id: shift.id }, data: { site_id: siteId, status: next, start_time: next === 'active' ? new Date() : null } });
+      await tx.users.update({ where: { id: userId }, data: { current_state: next } });
       return { odometerRequired: site.odometer_required };
-    });
-  }
-
-  async cancelShift(userId: number) {
-    await prisma.$transaction(async (tx) => {
-      const shift = await tx.shifts.findFirst({ where: { user_id: userId, status: { not: 'finished' } }, orderBy: { id: 'desc' } });
-      if (shift?.truck_id) {
-        await tx.dict_trucks.update({ where: { id: shift.truck_id }, data: { is_busy: false } });
-        await tx.shifts.delete({ where: { id: shift.id } });
-      }
-      await tx.users.update({ where: { id: userId }, data: { current_state: 'idle' } });
     });
   }
 
@@ -168,41 +117,26 @@ class ShiftService {
     return await prisma.$transaction(async (tx) => {
       const shift = await tx.shifts.findFirst({ where: { user_id: userId, status: 'active' }, include: { site: true, tenant: true } });
       if (!shift) throw new Error('Активная смена не найдена');
-
-      if (shift.site?.odometer_required) {
-        const next = 'awaiting_odo_end';
-        await tx.shifts.update({ where: { id: shift.id }, data: { status: next } });
-        await tx.users.update({ where: { id: userId }, data: { current_state: next } });
-        return { message: "📸 Пришлите фото одометра (ФИНИШ):" };
-      } 
-      
-      if (shift.tenant.invoice_required || shift.site?.invoice_required) {
-        const next = 'awaiting_invoice';
-        await tx.shifts.update({ where: { id: shift.id }, data: { status: next } });
-        await tx.users.update({ where: { id: userId }, data: { current_state: next } });
-        return { message: "📸 Пришлите фото НАКЛАДНОЙ:" };
-      }
-
-      return await this.finalizeShiftInternal(tx, shift.id);
+      let next = shift.site?.odometer_required ? 'awaiting_odo_end' : (shift.tenant.invoice_required || shift.site?.invoice_required ? 'awaiting_invoice' : 'finished');
+      if (next === 'finished') return await this.finalizeShiftInternal(tx, shift.id);
+      await tx.shifts.update({ where: { id: shift.id }, data: { status: next } });
+      await tx.users.update({ where: { id: userId }, data: { current_state: next } });
+      return { message: next === 'awaiting_odo_end' ? "📸 Пришлите фото одометра (ФИНИШ):" : "📸 Пришлите фото НАКЛАДНОЙ:" };
     });
   }
 
   async handleShiftPhoto(userId: number, fileId: string) {
     const user = await prisma.users.findUnique({ where: { id: userId }, include: { tenant: true } });
     if (!user) throw new Error('User not found');
-    
     const photoUrl = await mediaService.downloadAndSave(fileId, user.tenant_id!);
-
     return await prisma.$transaction(async (tx) => {
       const shift = await tx.shifts.findFirst({ where: { user_id: userId, status: { not: 'finished' } }, include: { site: true }, orderBy: { id: 'desc' } });
       if (!shift) throw new Error('Смена не найдена');
-
       if (user.current_state === 'awaiting_odo_start') {
         await tx.shifts.update({ where: { id: shift.id }, data: { photo_start_url: photoUrl, status: 'active', start_time: new Date() } });
         await tx.users.update({ where: { id: userId }, data: { current_state: 'active' } });
         return { message: "✅ Одометр принят. Смена открыта!" };
       }
-      
       if (user.current_state === 'awaiting_odo_end') {
         await tx.shifts.update({ where: { id: shift.id }, data: { photo_end_url: photoUrl } });
         if (user.tenant.invoice_required || shift.site?.invoice_required) {
@@ -212,27 +146,33 @@ class ShiftService {
         }
         return await this.finalizeShiftInternal(tx, shift.id);
       }
-
       if (user.current_state === 'awaiting_invoice') {
         await tx.shifts.update({ where: { id: shift.id }, data: { photo_invoice_url: photoUrl } });
         return await this.finalizeShiftInternal(tx, shift.id);
       }
-      
-      throw new Error('Некорректное состояние для загрузки фото');
+      throw new Error('Некорректное состояние');
+    });
+  }
+
+  async cancelShift(userId: number) {
+    await prisma.$transaction(async (tx) => {
+      const shift = await tx.shifts.findFirst({ where: { user_id: userId, status: { not: 'finished' } }, orderBy: { id: 'desc' } });
+      if (shift?.truck_id) await tx.dict_trucks.update({ where: { id: shift.truck_id }, data: { is_busy: false } });
+      if (shift) await tx.shifts.delete({ where: { id: shift.id } });
+      await tx.users.update({ where: { id: userId }, data: { current_state: 'idle' } });
     });
   }
 
   private async finalizeShiftInternal(tx: any, shiftId: number) {
     const shift = await tx.shifts.findUnique({ where: { id: shiftId }, include: { user: true } });
     const endTime = new Date();
-    const diff = endTime.getTime() - (shift.start_time?.getTime() || endTime.getTime());
+    const diff = endTime.getTime() - (shift!.start_time?.getTime() || endTime.getTime());
     const hours = Number((diff / (1000 * 60 * 60)).toFixed(2));
-    const salary = hours * Number(shift.user.hourly_rate || 0);
-
+    const salary = hours * Number(shift!.user.hourly_rate || 0);
     await tx.shifts.update({ where: { id: shiftId }, data: { status: 'finished', end_time: endTime, hours_worked: hours, salary: salary } });
-    await tx.dict_trucks.update({ where: { id: shift.truck_id }, data: { is_busy: false } });
-    await tx.users.update({ where: { id: shift.user_id }, data: { current_state: 'idle' } });
-    return { message: "🏁 Смена успешно завершена!", finished: true };
+    await tx.dict_trucks.update({ where: { id: shift!.truck_id! }, data: { is_busy: false } });
+    await tx.users.update({ where: { id: shift!.user_id }, data: { current_state: 'idle' } });
+    return { message: "🏁 Смена успешно завершена!" };
   }
 }
 
@@ -245,7 +185,7 @@ const GatewayController = {
     const { user_id, type, payload } = req.body;
     try {
       const user = await prisma.users.findUnique({ where: { tg_user_id: BigInt(user_id) }, include: { tenant: true } });
-      if (!user) return res.json(GatewayController.formatResponse("⚠️ Вы не зарегистрированы в системе."));
+      if (!user) return res.json(GatewayController.formatResponse("⚠️ Вы не зарегистрированы."));
 
       const activeShift = await prisma.shifts.findFirst({ where: { user_id: user.id, status: { not: 'finished' } } });
       let result: any;
@@ -264,12 +204,12 @@ const GatewayController = {
         result?.buttons || [],
         user.current_state,
         activeShift?.id,
-        user.id, // Внутренний ID юзера для n8n
-        user.last_menu_message_id?.toString() // ID старого меню для удаления
+        user.id,
+        user.last_menu_message_id?.toString()
       ));
     } catch (e: any) {
       console.error(e);
-      return res.json(GatewayController.formatResponse(`⚠️ Ошибка: ${e.message}`, [], "error"));
+      return res.json(GatewayController.formatResponse(`⚠️ Ошибка: ${e.message}`, [], "error", undefined, user_id));
     }
   },
 
@@ -282,88 +222,60 @@ const GatewayController = {
     if (data.startsWith('TRK_')) {
       await shiftService.selectTruck(user.id, parseId(data.split('_')[1]));
       const sites = await prisma.dict_sites.findMany({ where: { tenant_id: user.tenant_id, is_active: true } });
-      return { message: "📍 Теперь выберите объект:", buttons: sites.map(s => [{ text: s.name, callback_data: `STE_${s.id}` }]) };
+      return { message: "📍 Теперь объект:", buttons: sites.map(s => [{ text: s.name, callback_data: `STE_${s.id}` }]) };
     }
     if (data.startsWith('STE_')) {
       const res = await shiftService.selectSite(user.id, parseId(data.split('_')[1]));
-      return { message: res.odometerRequired ? "📸 Пришлите фото одометра (СТАРТ):" : "🚀 Смена открыта! Работайте.", buttons: (res.odometerRequired ? [] : [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]]) };
+      return { message: res.odometerRequired ? "📸 Пришлите фото одометра (СТАРТ):" : "🚀 Смена открыта!", buttons: res.odometerRequired ? [] : [[{ text: "🏁 Завершить", callback_data: "END_SHIFT" }]] };
     }
     if (data === 'END_SHIFT') return await shiftService.requestEndShift(user.id);
-    if (data === 'CANCEL') {
-      await shiftService.cancelShift(user.id);
-      return { message: "❌ Процесс отменен." };
-    }
+    if (data === 'CANCEL') { await shiftService.cancelShift(user.id); return { message: "❌ Отменено." }; }
     return { message: "Меню:" };
   },
 
   async processText(user: any, text: string, activeShift: any) {
-    const cleanText = text.trim().toLowerCase();
-    if (cleanText === '/start' || cleanText === 'меню') {
-      return { 
-        message: `Привет, ${user.full_name}! Чем могу помочь?`, 
-        buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]] 
-      };
-    }
+    const t = text.trim().toLowerCase();
+    if (t === '/start' || t === 'меню') return { message: `Привет, ${user.full_name}!`, buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]] };
     if (user.current_state === 'active' && activeShift) {
       await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: text } });
-      return { message: "✅ Комментарий к смене обновлен." };
+      return { message: "✅ Комментарий обновлен." };
     }
-    return { message: "Используйте кнопки меню." };
+    return { message: "Используйте меню." };
   },
 
   formatResponse(text: string, buttons: any[] = [], state: string = 'idle', shiftId?: number, userInternalId?: number, lastMenuId?: string) {
     return {
       ui: { method: "sendMessage", text, buttons, delete_original: !!lastMenuId },
-      state: { 
-        current_step: state, 
-        active_shift_id: shiftId || null, 
-        user_internal_id: userInternalId,
-        last_menu_message_id: lastMenuId || null 
-      }
+      state: { current_step: state, active_shift_id: shiftId || null, user_internal_id: userInternalId, last_menu_message_id: lastMenuId || null }
     };
   }
 };
 
 // --- 6. ROUTES ---
+const api = express.Router();
 
-app.post('/api/v1/users/set-menu-id', async (req, res) => {
-  try {
-    const { user_id, message_id } = req.body;
-    await prisma.users.update({
-      where: { id: parseId(user_id) },
-      data: { last_menu_message_id: BigInt(message_id) }
-    });
-    res.json({ success: true });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+api.post('/gateway', GatewayController.handleWebhook);
+
+api.post('/users/set-menu-id', async (req, res) => {
+  const { user_id, message_id } = req.body;
+  await prisma.users.update({ where: { id: parseId(user_id) }, data: { last_menu_message_id: BigInt(message_id) } });
+  res.json({ success: true });
 });
 
-app.post('/api/v1/gateway', GatewayController.handleWebhook);
-
-app.post('/api/v1/auth/onboard', async (req, res) => {
-  try {
-    const { company_name, admin_name, email, password, timezone, tg_user_id } = req.body;
-    const hash = await bcrypt.hash(password, 10);
-    const plan = await prisma.plans.findFirst({ where: { code: 'free' } });
-    
-    const result = await prisma.$transaction(async (tx) => {
-      const tenant = await tx.tenants.create({ data: { name: company_name, plan_id: plan!.id, timezone: timezone || 'Europe/Moscow' } });
-      const user = await tx.users.create({ data: { 
-        tenant_id: tenant.id, 
-        role: 'admin', 
-        full_name: admin_name, 
-        email, 
-        password_hash: hash,
-        tg_user_id: tg_user_id ? BigInt(tg_user_id) : null,
-        current_state: 'idle'
-      } });
-      return { tenant, user };
-    });
-    res.json(result);
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+api.post('/auth/onboard', async (req, res) => {
+  const { company_name, admin_name, email, password, timezone, tg_user_id } = req.body;
+  const hash = await bcrypt.hash(password, 10);
+  const plan = await prisma.plans.findFirst({ where: { code: 'free' } });
+  const result = await prisma.$transaction(async (tx) => {
+    const tenant = await tx.tenants.create({ data: { name: company_name, plan_id: plan!.id, timezone: timezone || 'Europe/Moscow' } });
+    const user = await tx.users.create({ data: { tenant_id: tenant.id, role: 'admin', full_name: admin_name, email, password_hash: hash, tg_user_id: tg_user_id ? BigInt(tg_user_id) : null, current_state: 'idle' } });
+    return { tenant, user };
+  });
+  res.json(result);
 });
 
-app.get('/api/v1/admin/stats', authenticateJWT, async (req: any, res) => {
-  const tid = req.user.tenant_id;
+api.get('/admin/stats', authenticateJWT, async (req: Request, res: Response) => {
+  const tid = req.user!.tenant_id;
   const [active, trucks, photos] = await Promise.all([
     prisma.shifts.count({ where: { tenant_id: tid, status: { not: 'finished' } } }),
     prisma.dict_trucks.count({ where: { tenant_id: tid, is_busy: true } }),
@@ -372,4 +284,6 @@ app.get('/api/v1/admin/stats', authenticateJWT, async (req: any, res) => {
   res.json({ activeShifts: active, busyTrucks: trucks, photos24h: photos });
 });
 
-app.listen(PORT, () => console.log(`🚀 LogiShift Backend на порту ${PORT}`));
+app.use('/api/v1', api);
+
+app.listen(PORT, () => console.log(`🚀 Server ready on port ${PORT}`));
