@@ -49,6 +49,7 @@ model users {
   current_state String   @default("idle") 
   
   hourly_rate   Decimal  @default(0) @db.Decimal(12, 2)
+  last_menu_message_id BigInt?
   settings      Json?    // Запас на будущее (язык, тема)
   
   tenant        tenants  @relation(fields: [tenant_id], references: [id])
