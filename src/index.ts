@@ -9,6 +9,8 @@ import cors from 'cors';
 import axios from 'axios';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+
+// Расширяем типы Express для работы с JWT
 declare global {
   namespace Express {
     interface Request {
@@ -34,11 +36,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './uploads';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-key';
-const CDN_URL = 'https://bot.kontrolsmen.ru/uploads';
 const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 app.use(cors());
 app.use(express.json());
+// Делаем папку с фото доступной извне
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 // --- 3. UTILS ---
 const parseId = (id: any): number => {
@@ -55,7 +58,6 @@ const formatInTimezone = (date: Date | null, timezone: string = 'Europe/Moscow')
   });
 };
 
-// Middleware для защиты админских роутов
 const authenticateJWT = (req: any, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
   if (authHeader) {
@@ -74,13 +76,11 @@ const authenticateJWT = (req: any, res: Response, next: NextFunction) => {
 
 class MediaService {
   async downloadAndSave(fileId: string, tenantId: number): Promise<string> {
-    if (!TG_BOT_TOKEN) throw new Error('TG_BOT_TOKEN не настроен');
+    if (!TG_BOT_TOKEN) throw new Error('TG_BOT_TOKEN не настроен в .env');
     
-    // 1. Получаем путь
     const { data: fileData } = await axios.get(`https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile?file_id=${fileId}`);
     const filePath = fileData.result.file_path;
     
-    // 2. Путь на диске
     const now = new Date();
     const relativeDir = path.join(
       tenantId.toString(),
@@ -97,7 +97,6 @@ class MediaService {
     const absolutePath = path.join(absoluteDir, fileName);
     const dbPath = path.join(relativeDir, fileName);
 
-    // 3. Скачиваем
     const response = await axios({
       method: 'GET',
       url: `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${filePath}`,
@@ -119,11 +118,10 @@ class ShiftService {
   async selectTruck(userId: number, truckId: number) {
     return await prisma.$transaction(async (tx) => {
       const truck = await tx.dict_trucks.findUnique({ where: { id: truckId } });
-      if (!truck || (!truck.is_active)) throw new Error('Машина недоступна');
-      if (truck.is_busy) throw new Error('Машина уже занята');
+      if (!truck || truck.is_busy || !truck.is_active) throw new Error('Машина занята или недоступна');
 
       await tx.dict_trucks.update({ where: { id: truckId }, data: { is_busy: true } });
-      const shift = await tx.shifts.create({
+      await tx.shifts.create({
         data: {
           user_id: userId,
           tenant_id: truck.tenant_id!,
@@ -132,7 +130,6 @@ class ShiftService {
         }
       });
       await tx.users.update({ where: { id: userId }, data: { current_state: 'pending_site' } });
-      return shift;
     });
   }
 
@@ -173,15 +170,17 @@ class ShiftService {
       if (!shift) throw new Error('Активная смена не найдена');
 
       if (shift.site?.odometer_required) {
-        await tx.shifts.update({ where: { id: shift.id }, data: { status: 'awaiting_odo_end' } });
-        await tx.users.update({ where: { id: userId }, data: { current_state: 'awaiting_odo_end' } });
-        return { message: "📸 Пришлите фото одометра (ФИНИШ):", status: 'awaiting_odo_end' };
+        const next = 'awaiting_odo_end';
+        await tx.shifts.update({ where: { id: shift.id }, data: { status: next } });
+        await tx.users.update({ where: { id: userId }, data: { current_state: next } });
+        return { message: "📸 Пришлите фото одометра (ФИНИШ):" };
       } 
       
       if (shift.tenant.invoice_required || shift.site?.invoice_required) {
-        await tx.shifts.update({ where: { id: shift.id }, data: { status: 'awaiting_invoice' } });
-        await tx.users.update({ where: { id: userId }, data: { current_state: 'awaiting_invoice' } });
-        return { message: "📸 Пришлите фото НАКЛАДНОЙ:", status: 'awaiting_invoice' };
+        const next = 'awaiting_invoice';
+        await tx.shifts.update({ where: { id: shift.id }, data: { status: next } });
+        await tx.users.update({ where: { id: userId }, data: { current_state: next } });
+        return { message: "📸 Пришлите фото НАКЛАДНОЙ:" };
       }
 
       return await this.finalizeShiftInternal(tx, shift.id);
@@ -265,7 +264,8 @@ const GatewayController = {
         result?.buttons || [],
         user.current_state,
         activeShift?.id,
-        true
+        user.id, // Внутренний ID юзера для n8n
+        user.last_menu_message_id?.toString() // ID старого меню для удаления
       ));
     } catch (e: any) {
       console.error(e);
@@ -286,47 +286,46 @@ const GatewayController = {
     }
     if (data.startsWith('STE_')) {
       const res = await shiftService.selectSite(user.id, parseId(data.split('_')[1]));
-      return { message: res.odometerRequired ? "📸 Пришлите фото одометра (СТАРТ):" : "🚀 Смена открыта! Работайте.", buttons: [] };
+      return { message: res.odometerRequired ? "📸 Пришлите фото одометра (СТАРТ):" : "🚀 Смена открыта! Работайте.", buttons: (res.odometerRequired ? [] : [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]]) };
     }
     if (data === 'END_SHIFT') return await shiftService.requestEndShift(user.id);
     if (data === 'CANCEL') {
       await shiftService.cancelShift(user.id);
       return { message: "❌ Процесс отменен." };
     }
+    return { message: "Меню:" };
   },
 
   async processText(user: any, text: string, activeShift: any) {
-  const cleanText = text.trim().toLowerCase();
+    const cleanText = text.trim().toLowerCase();
+    if (cleanText === '/start' || cleanText === 'меню') {
+      return { 
+        message: `Привет, ${user.full_name}! Чем могу помочь?`, 
+        buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]] 
+      };
+    }
+    if (user.current_state === 'active' && activeShift) {
+      await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: text } });
+      return { message: "✅ Комментарий к смене обновлен." };
+    }
+    return { message: "Используйте кнопки меню." };
+  },
 
-  // Реакция на старт или меню
-  if (cleanText === '/start' || cleanText === 'меню') {
-    return { 
-      message: `Привет, ${user.full_name}! Чем могу помочь?`, 
-      buttons: [
-        [{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }],
-        [{ text: "📊 Статус", callback_data: "STATUS" }]
-      ] 
-    };
-  }
-
-  // Если юзер в состоянии работы — пишем комментарий
-  if (user.current_state === 'active' && activeShift) {
-    await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: text } });
-    return { message: "✅ Комментарий к смене обновлен." };
-  }
-
-  return { message: "Не понимаю вас. Используйте кнопки меню или напишите /start." };
-},
-
-  formatResponse(text: string, buttons: any[] = [], state: string = 'idle', shiftId?: number, deleteOrig: boolean = false) {
+  formatResponse(text: string, buttons: any[] = [], state: string = 'idle', shiftId?: number, userInternalId?: number, lastMenuId?: string) {
     return {
-      ui: { method: "sendMessage", text, buttons, delete_original: deleteOrig },
-      state: { current_step: state, active_shift_id: shiftId || null, last_menu_message_id: lastMenuId  }
+      ui: { method: "sendMessage", text, buttons, delete_original: !!lastMenuId },
+      state: { 
+        current_step: state, 
+        active_shift_id: shiftId || null, 
+        user_internal_id: userInternalId,
+        last_menu_message_id: lastMenuId || null 
+      }
     };
   }
 };
 
 // --- 6. ROUTES ---
+
 app.post('/api/v1/users/set-menu-id', async (req, res) => {
   try {
     const { user_id, message_id } = req.body;
@@ -340,57 +339,29 @@ app.post('/api/v1/users/set-menu-id', async (req, res) => {
 
 app.post('/api/v1/gateway', GatewayController.handleWebhook);
 
-// Регистрация админа
 app.post('/api/v1/auth/onboard', async (req, res) => {
   try {
     const { company_name, admin_name, email, password, timezone, tg_user_id } = req.body;
-    
-    // Хешируем пароль для безопасности
     const hash = await bcrypt.hash(password, 10);
-    
-    // Ищем дефолтный план (мы его создали в базе ранее)
     const plan = await prisma.plans.findFirst({ where: { code: 'free' } });
-    if (!plan) throw new Error('Тарифный план "free" не найден в базе. Сначала выполните сид базы.');
-
+    
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Создаем компанию
-      const tenant = await tx.tenants.create({ 
-        data: { 
-          name: company_name, 
-          plan_id: plan.id, 
-          timezone: timezone || 'Europe/Moscow' 
-        } 
-      });
-
-      // 2. Создаем пользователя-админа
-      const user = await tx.users.create({ 
-        data: { 
-          tenant_id: tenant.id, 
-          role: 'admin', 
-          full_name: admin_name, 
-          email: email, 
-          password_hash: hash,
-          // Важно: переводим в BigInt для корректного хранения Telegram ID
-          tg_user_id: tg_user_id ? BigInt(tg_user_id) : null,
-          current_state: 'idle'
-        } 
-      });
-
+      const tenant = await tx.tenants.create({ data: { name: company_name, plan_id: plan!.id, timezone: timezone || 'Europe/Moscow' } });
+      const user = await tx.users.create({ data: { 
+        tenant_id: tenant.id, 
+        role: 'admin', 
+        full_name: admin_name, 
+        email, 
+        password_hash: hash,
+        tg_user_id: tg_user_id ? BigInt(tg_user_id) : null,
+        current_state: 'idle'
+      } });
       return { tenant, user };
     });
-
-    res.json({
-      success: true,
-      message: "Компания и админ успешно созданы",
-      data: result
-    });
-  } catch (e: any) { 
-    console.error('Onboard Error:', e);
-    res.status(500).json({ error: e.message }); 
-  }
+    res.json(result);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
-// Админские роуты (PWA)
 app.get('/api/v1/admin/stats', authenticateJWT, async (req: any, res) => {
   const tid = req.user.tenant_id;
   const [active, trucks, photos] = await Promise.all([
