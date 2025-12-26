@@ -321,12 +321,22 @@ const GatewayController = {
   formatResponse(text: string, buttons: any[] = [], state: string = 'idle', shiftId?: number, deleteOrig: boolean = false) {
     return {
       ui: { method: "sendMessage", text, buttons, delete_original: deleteOrig },
-      state: { current_step: state, active_shift_id: shiftId || null }
+      state: { current_step: state, active_shift_id: shiftId || null, last_menu_message_id: lastMenuId  }
     };
   }
 };
 
 // --- 6. ROUTES ---
+app.post('/api/v1/users/set-menu-id', async (req, res) => {
+  try {
+    const { user_id, message_id } = req.body;
+    await prisma.users.update({
+      where: { id: parseId(user_id) },
+      data: { last_menu_message_id: BigInt(message_id) }
+    });
+    res.json({ success: true });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
 
 app.post('/api/v1/gateway', GatewayController.handleWebhook);
 
