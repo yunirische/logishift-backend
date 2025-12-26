@@ -296,12 +296,27 @@ const GatewayController = {
   },
 
   async processText(user: any, text: string, activeShift: any) {
-    if (user.current_state === 'active' && activeShift) {
-      await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: text } });
-      return { message: "✅ Комментарий к смене обновлен." };
-    }
-    return { message: "Не понимаю вас. Используйте кнопки меню." };
-  },
+  const cleanText = text.trim().toLowerCase();
+
+  // Реакция на старт или меню
+  if (cleanText === '/start' || cleanText === 'меню') {
+    return { 
+      message: `Привет, ${user.full_name}! Чем могу помочь?`, 
+      buttons: [
+        [{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }],
+        [{ text: "📊 Статус", callback_data: "STATUS" }]
+      ] 
+    };
+  }
+
+  // Если юзер в состоянии работы — пишем комментарий
+  if (user.current_state === 'active' && activeShift) {
+    await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: text } });
+    return { message: "✅ Комментарий к смене обновлен." };
+  }
+
+  return { message: "Не понимаю вас. Используйте кнопки меню или напишите /start." };
+},
 
   formatResponse(text: string, buttons: any[] = [], state: string = 'idle', shiftId?: number, deleteOrig: boolean = false) {
     return {
@@ -318,17 +333,51 @@ app.post('/api/v1/gateway', GatewayController.handleWebhook);
 // Регистрация админа
 app.post('/api/v1/auth/onboard', async (req, res) => {
   try {
-    const { company_name, admin_name, email, password, timezone } = req.body;
-    const hash = await bcrypt.hash(password, 10);
-    const plan = await prisma.plans.findFirst({ where: { code: 'free' } });
+    const { company_name, admin_name, email, password, timezone, tg_user_id } = req.body;
     
+    // Хешируем пароль для безопасности
+    const hash = await bcrypt.hash(password, 10);
+    
+    // Ищем дефолтный план (мы его создали в базе ранее)
+    const plan = await prisma.plans.findFirst({ where: { code: 'free' } });
+    if (!plan) throw new Error('Тарифный план "free" не найден в базе. Сначала выполните сид базы.');
+
     const result = await prisma.$transaction(async (tx) => {
-      const tenant = await tx.tenants.create({ data: { name: company_name, plan_id: plan!.id, timezone: timezone || 'Europe/Moscow' } });
-      const user = await tx.users.create({ data: { tenant_id: tenant.id, role: 'admin', full_name: admin_name, email, password_hash: hash } });
+      // 1. Создаем компанию
+      const tenant = await tx.tenants.create({ 
+        data: { 
+          name: company_name, 
+          plan_id: plan.id, 
+          timezone: timezone || 'Europe/Moscow' 
+        } 
+      });
+
+      // 2. Создаем пользователя-админа
+      const user = await tx.users.create({ 
+        data: { 
+          tenant_id: tenant.id, 
+          role: 'admin', 
+          full_name: admin_name, 
+          email: email, 
+          password_hash: hash,
+          // Важно: переводим в BigInt для корректного хранения Telegram ID
+          tg_user_id: tg_user_id ? BigInt(tg_user_id) : null,
+          current_state: 'idle'
+        } 
+      });
+
       return { tenant, user };
     });
-    res.json(result);
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+
+    res.json({
+      success: true,
+      message: "Компания и админ успешно созданы",
+      data: result
+    });
+  } catch (e: any) { 
+    console.error('Onboard Error:', e);
+    res.status(500).json({ error: e.message }); 
+  }
 });
 
 // Админские роуты (PWA)
