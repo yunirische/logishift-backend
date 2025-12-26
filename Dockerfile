@@ -1,33 +1,32 @@
-# Используем Node 20 для лучшей совместимости с Prisma
+# Используем Node.js 20
 FROM node:20-alpine
 
-# Устанавливаем системные библиотеки, без которых Prisma упадет на Alpine
+# Устанавливаем библиотеки для Prisma (обязательно для Alpine)
 RUN apk add --no-cache openssl libc6-compat
 
 WORKDIR /app
 
-# Копируем файлы зависимостей
+# Копируем файлы зависимостей (они должны быть в корне на GitHub!)
 COPY package*.json ./
 COPY tsconfig.json ./
 
 # Устанавливаем зависимости
 RUN npm install
 
-# Копируем папку Prisma (она должна быть в корне на GitHub!)
+# Копируем папку prisma (она должна быть в корне на GitHub!)
 COPY prisma ./prisma/
 
 # Генерируем клиент Prisma
-# DATABASE_URL нужен только как заглушка для билда
 RUN DATABASE_URL="postgresql://unused:unused@localhost:5432/unused" npx prisma generate
 
-# Копируем весь исходный код
+# Копируем исходный код
 COPY src ./src/
 
-# Компилируем TypeScript в JavaScript
+# Собираем TypeScript в JavaScript
 RUN npm run build
 
-# Открываем порт
+# Порт приложения
 EXPOSE 3000
 
-# Запускаем именно через Node.js
+# Запуск приложения через Node.js
 CMD ["node", "dist/index.js"]
