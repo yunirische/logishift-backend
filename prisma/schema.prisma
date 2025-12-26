@@ -11,8 +11,13 @@ datasource db {
 
 model plans {
   id             Int       @id @default(autoincrement())
-  code           String    @unique
-  name           String
+  code           String    @unique @db.VarChar(50)
+  name           String    @db.VarChar(100)
+  price_monthly  Decimal   @default(0) @db.Decimal(10, 2)
+  limit_machines Int       @default(0)
+  limit_drivers  Int       @default(0)
+  is_active      Boolean   @default(true)
+  limit_sites    Int       @default(-1)
   tenants        tenants[]
 }
 
