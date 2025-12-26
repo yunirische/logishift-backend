@@ -101,7 +101,7 @@ model shifts {
   mileage_end        Int?
   
   comment            String?
-  updated_at         DateTime     @updated_at
+  updated_at         DateTime     @updatedAt
   created_at         DateTime     @default(now()) // Полезно для сортировки
 
   tenant             tenants      @relation(fields: [tenant_id], references: [id])
