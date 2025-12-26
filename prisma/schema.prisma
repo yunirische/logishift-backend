@@ -70,6 +70,7 @@ model dict_sites {
   code              String?
   odometer_required Boolean  @default(false)
   invoice_required  Boolean  @default(false)
+  is_active         Boolean  @default(true)
   tenant            tenants  @relation(fields: [tenant_id], references: [id])
   shifts            shifts[]
 }
