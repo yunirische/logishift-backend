@@ -22,13 +22,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './uploads';
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key';
-const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// ВАЖНО: Имя переменной должно совпадать с Portainer
+const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN; 
 
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(UPLOAD_DIR));
 
-// Интерфейс для расширения Request
 interface AuthRequest extends Request {
   user?: { id: number; tenant_id: number; role: string };
 }
@@ -66,15 +66,20 @@ const authenticateJWT = (req: AuthRequest, res: Response, next: NextFunction) =>
 
 class MediaService {
   async downloadAndSave(fileId: string, tenantId: number): Promise<string> {
-    if (!TG_BOT_TOKEN) throw new Error('TG_BOT_TOKEN missing');
+    if (!TG_BOT_TOKEN) throw new Error('TG_BOT_TOKEN missing in environment');
+    
     const { data: fileData } = await axios.get(`https://api.telegram.org/bot${TG_BOT_TOKEN}/getFile?file_id=${fileId}`);
     const filePath = fileData.result.file_path;
+    
     const now = new Date();
     const relativeDir = path.join(tenantId.toString(), now.getFullYear().toString(), (now.getMonth() + 1).toString().padStart(2, '0'));
     const absoluteDir = path.join(UPLOAD_DIR, relativeDir);
+    
     if (!existsSync(absoluteDir)) await fs.mkdir(absoluteDir, { recursive: true });
+    
     const fileName = `${Date.now()}-${path.basename(filePath)}`;
     const response = await axios({ method: 'GET', url: `https://api.telegram.org/file/bot${TG_BOT_TOKEN}/${filePath}`, responseType: 'arraybuffer' });
+    
     await fs.writeFile(path.join(absoluteDir, fileName), response.data);
     return path.join(relativeDir, fileName);
   }
@@ -178,7 +183,6 @@ const shiftService = new ShiftService();
 
 const GatewayController = {
   async handleWebhook(req: Request, res: Response) {
-    // Извлекаем данные, страхуемся от пустых значений
     const { user_id, type, payload } = req.body;
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
 
@@ -189,18 +193,19 @@ const GatewayController = {
       });
 
       if (!user) {
-        return res.json(GatewayController.formatResponse("⚠️ Вы не зарегистрированы в системе. Обратитесь к администратору."));
+        return res.json(GatewayController.formatResponse("⚠️ Вы не зарегистрированы в системе."));
       }
 
+      // ВАЖНО: Добавили include truck и site для корректного отображения в меню
       const activeShift = await prisma.shifts.findFirst({ 
-  where: { user_id: user.id, status: { not: 'finished' } },
-  include: { truck: true, site: true } // Добавьте include
-});
+        where: { user_id: user.id, status: { not: 'finished' } },
+        include: { truck: true, site: true }
+      });
 
       let result: any;
 
       if (type === 'callback') {
-        result = await GatewayController.processCallback(user, payload.data);
+        result = await GatewayController.processCallback(user, payload.data, activeShift);
       } else if (type === 'text') {
         result = await GatewayController.processText(user, payload.text, activeShift);
       } else if (type === 'photo') {
@@ -209,19 +214,17 @@ const GatewayController = {
 
       const timeStr = formatInTimezone(new Date(), user.tenant?.timezone);
       
-      // Формируем чистый ответ
       return res.json(GatewayController.formatResponse(
         `${result?.message || "Меню:"}\n\n🕒 ${timeStr}`,
         result?.buttons || [],
         user.current_state,
         activeShift?.id,
         user.id,
-        user.last_menu_message_id?.toString() // Превращаем BigInt в строку для n8n
+        user.last_menu_message_id?.toString()
       ));
 
     } catch (e: any) {
       console.error('GATEWAY ERROR:', e);
-      // В случае ошибки возвращаем безопасный ответ, чтобы n8n не зациклился
       return res.json({
         ui: { method: "sendMessage", text: `❌ Ошибка сервера: ${e.message}`, buttons: [], delete_original: false },
         state: { current_step: "error", active_shift_id: null }
@@ -229,7 +232,17 @@ const GatewayController = {
     }
   },
 
-  async processCallback(user: any, data: string) {
+  async processCallback(user: any, data: string, activeShift: any) {
+    // Кнопка СТАТУС
+    if (data === 'STATUS') {
+      if (!activeShift) return { message: "У вас нет активной смены." };
+      const timeStr = formatInTimezone(activeShift.start_time, user.tenant?.timezone);
+      return { 
+        message: `📄 *Ваша смена:*\n\n⏱ Начало: ${timeStr}\n🚛 Машина: ${activeShift.truck?.name}\n📍 Объект: ${activeShift.site?.name}`,
+        buttons: [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]]
+      };
+    }
+
     if (data === 'START_SHIFT') {
       await shiftService.startShiftDraft(user.id);
       const trucks = await prisma.dict_trucks.findMany({ where: { tenant_id: user.tenant_id, is_active: true, is_busy: false } });
@@ -242,7 +255,10 @@ const GatewayController = {
     }
     if (data.startsWith('STE_')) {
       const res = await shiftService.selectSite(user.id, parseId(data.split('_')[1]));
-      return { message: res.odometerRequired ? "📸 Пришлите фото одометра (СТАРТ):" : "🚀 Смена открыта!", buttons: res.odometerRequired ? [] : [[{ text: "🏁 Завершить", callback_data: "END_SHIFT" }]] };
+      return { 
+        message: res.odometerRequired ? "📸 Пришлите фото одометра (СТАРТ):" : "🚀 Смена открыта!", 
+        buttons: res.odometerRequired ? [] : [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]] 
+      };
     }
     if (data === 'END_SHIFT') return await shiftService.requestEndShift(user.id);
     if (data === 'CANCEL') { await shiftService.cancelShift(user.id); return { message: "❌ Отменено." }; }
@@ -253,92 +269,44 @@ const GatewayController = {
     const t = text.trim().toLowerCase();
     
     if (t === '/start' || t === 'меню') {
-      // Если смена активна, показываем кнопки управления сменой
-      if (activeShift) {
+      if (activeShift && activeShift.status === 'active') {
         return { 
-          message: `👷 Смена активна!\n🚛 Машина: ${activeShift.truck?.name || '---'}\n📍 Объект: ${activeShift.site?.name || '---'}`, 
+          message: `👷 Смена активна!\n🚛 Машина: ${activeShift.truck?.name}\n📍 Объект: ${activeShift.site?.name}`, 
           buttons: [
             [{ text: "📊 Статус", callback_data: "STATUS" }],
             [{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]
           ] 
         };
       }
-      // Если смены нет, показываем кнопку старта
-      return { 
-        message: `Привет, ${user.full_name}! Начнем работу?`, 
-        buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]] 
-      };
+      return { message: `Привет, ${user.full_name}!`, buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]] };
     }
 
     if (user.current_state === 'active' && activeShift) {
       await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: text } });
-      return { message: "✅ Комментарий к смене сохранен." };
+      return { message: "✅ Комментарий обновлен." };
     }
-    
-    return { message: "Используйте меню для управления." };
+    return { message: "Используйте меню." };
   },
 
-  async processCallback(user: any, data: string) {
-    // Обработка кнопки СТАТУС
-    if (data === 'STATUS') {
-      const shift = await prisma.shifts.findFirst({
-        where: { user_id: user.id, status: 'active' },
-        include: { truck: true, site: true }
-      });
-      if (!shift) return { message: "У вас нет активной смены." };
-      const timeStr = formatInTimezone(shift.start_time, user.tenant?.timezone);
-      return { 
-        message: `📄 *Ваша смена:*\n\n⏱ Начало: ${timeStr}\n🚛 Машина: ${shift.truck?.name}\n📍 Объект: ${shift.site?.name}`,
-        buttons: [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]]
-      };
-    }
-
-    if (data === 'START_SHIFT') {
-      await shiftService.startShiftDraft(user.id);
-      const trucks = await prisma.dict_trucks.findMany({ where: { tenant_id: user.tenant_id, is_active: true, is_busy: false } });
-      return { message: "🚚 Выберите машину:", buttons: trucks.map(t => [{ text: t.name, callback_data: `TRK_${t.id}` }]) };
-    }
-    
-    if (data.startsWith('TRK_')) {
-      await shiftService.selectTruck(user.id, parseId(data.split('_')[1]));
-      const sites = await prisma.dict_sites.findMany({ where: { tenant_id: user.tenant_id, is_active: true } });
-      return { message: "📍 Теперь выберите объект:", buttons: sites.map(s => [{ text: s.name, callback_data: `STE_${s.id}` }]) };
-    }
-    
-    if (data.startsWith('STE_')) {
-      const res = await shiftService.selectSite(user.id, parseId(data.split('_')[1]));
-      // Если одометр не нужен, сразу даем кнопку завершения
-      return { 
-        message: res.odometerRequired ? "📸 Пришлите фото одометра (СТАРТ):" : "🚀 Смена открыта!", 
-        buttons: res.odometerRequired ? [] : [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]] 
-      };
-    }
-    
-    if (data === 'END_SHIFT') return await shiftService.requestEndShift(user.id);
-    
-    if (data === 'CANCEL') { 
-      await shiftService.cancelShift(user.id); 
-      return { message: "❌ Процесс отменен." }; 
-    }
-  },
+  formatResponse(text: string, buttons: any[] = [], state: string = 'idle', shiftId?: number, userInternalId?: number, lastMenuId?: string) {
+    return {
+      ui: { method: "sendMessage", text, buttons, delete_original: !!lastMenuId },
+      state: { current_step: state, active_shift_id: shiftId || null, user_internal_id: userInternalId, last_menu_message_id: lastMenuId || null }
+    };
+  }
+};
 
 // --- 6. ROUTES ---
 const api = express.Router();
 
 api.post('/gateway', GatewayController.handleWebhook);
 
-// Эндпоинт для n8n: сохранить ID сообщения, которое бот только что отправил
 api.post('/users/set-menu-id', async (req, res) => {
   try {
     const { user_id, message_id } = req.body;
-    await prisma.users.update({ 
-      where: { id: parseId(user_id) }, 
-      data: { last_menu_message_id: BigInt(message_id) } 
-    });
+    await prisma.users.update({ where: { id: parseId(user_id) }, data: { last_menu_message_id: BigInt(message_id) } });
     res.json({ success: true });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 api.post('/auth/onboard', async (req, res) => {
