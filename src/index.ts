@@ -249,6 +249,7 @@ const GatewayController = {
   },
 
   async processText(user: any, text: string, activeShift: any) {
+    if (!text || typeof text !== 'string') { return { message: "⚠️ Ошибка: текст сообщения не получен. Попробуйте нажать /start" }; }
     const t = text.trim().toLowerCase();
     if (t === '/start' || t === 'меню') return { message: `Привет, ${user.full_name}!`, buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]] };
     if (user.current_state === 'active' && activeShift) {
