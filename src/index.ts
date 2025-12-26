@@ -178,12 +178,24 @@ const shiftService = new ShiftService();
 
 const GatewayController = {
   async handleWebhook(req: Request, res: Response) {
+    // Извлекаем данные, страхуемся от пустых значений
     const { user_id, type, payload } = req.body;
-    try {
-      const user = await prisma.users.findUnique({ where: { tg_user_id: BigInt(user_id) }, include: { tenant: true } });
-      if (!user) return res.json(GatewayController.formatResponse("⚠️ Вы не зарегистрированы."));
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
 
-      const activeShift = await prisma.shifts.findFirst({ where: { user_id: user.id, status: { not: 'finished' } } });
+    try {
+      const user = await prisma.users.findUnique({ 
+        where: { tg_user_id: BigInt(user_id) }, 
+        include: { tenant: true } 
+      });
+
+      if (!user) {
+        return res.json(GatewayController.formatResponse("⚠️ Вы не зарегистрированы в системе. Обратитесь к администратору."));
+      }
+
+      const activeShift = await prisma.shifts.findFirst({ 
+        where: { user_id: user.id, status: { not: 'finished' } } 
+      });
+
       let result: any;
 
       if (type === 'callback') {
@@ -195,17 +207,24 @@ const GatewayController = {
       }
 
       const timeStr = formatInTimezone(new Date(), user.tenant?.timezone);
+      
+      // Формируем чистый ответ
       return res.json(GatewayController.formatResponse(
         `${result?.message || "Меню:"}\n\n🕒 ${timeStr}`,
         result?.buttons || [],
         user.current_state,
         activeShift?.id,
         user.id,
-        user.last_menu_message_id?.toString()
+        user.last_menu_message_id?.toString() // Превращаем BigInt в строку для n8n
       ));
+
     } catch (e: any) {
-      console.error(e);
-      return res.json(GatewayController.formatResponse(`⚠️ Ошибка: ${e.message}`, [], "error", undefined, user_id));
+      console.error('GATEWAY ERROR:', e);
+      // В случае ошибки возвращаем безопасный ответ, чтобы n8n не зациклился
+      return res.json({
+        ui: { method: "sendMessage", text: `❌ Ошибка сервера: ${e.message}`, buttons: [], delete_original: false },
+        state: { current_step: "error", active_shift_id: null }
+      });
     }
   },
 
@@ -241,8 +260,19 @@ const GatewayController = {
 
   formatResponse(text: string, buttons: any[] = [], state: string = 'idle', shiftId?: number, userInternalId?: number, lastMenuId?: string) {
     return {
-      ui: { method: "sendMessage", text, buttons, delete_original: !!lastMenuId },
-      state: { current_step: state, active_shift_id: shiftId || null, user_internal_id: userInternalId, last_menu_message_id: lastMenuId || null }
+      ui: { 
+        method: "sendMessage", 
+        text, 
+        buttons, 
+        // Если есть ID старого меню, даем команду n8n его удалить
+        delete_original: !!lastMenuId 
+      },
+      state: { 
+        current_step: state, 
+        active_shift_id: shiftId || null, 
+        user_internal_id: userInternalId || null, 
+        last_menu_message_id: lastMenuId || null 
+      }
     };
   }
 };
@@ -252,10 +282,18 @@ const api = express.Router();
 
 api.post('/gateway', GatewayController.handleWebhook);
 
+// Эндпоинт для n8n: сохранить ID сообщения, которое бот только что отправил
 api.post('/users/set-menu-id', async (req, res) => {
-  const { user_id, message_id } = req.body;
-  await prisma.users.update({ where: { id: parseId(user_id) }, data: { last_menu_message_id: BigInt(message_id) } });
-  res.json({ success: true });
+  try {
+    const { user_id, message_id } = req.body;
+    await prisma.users.update({ 
+      where: { id: parseId(user_id) }, 
+      data: { last_menu_message_id: BigInt(message_id) } 
+    });
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 api.post('/auth/onboard', async (req, res) => {
