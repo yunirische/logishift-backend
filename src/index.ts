@@ -11,7 +11,7 @@ import jwt from 'jsonwebtoken';
 
 dotenv.config();
 
-// --- 1. ГЛОБАЛЬНЫЕ ПАТЧИ (BigInt serialization) ---
+// --- 1. ГЛОБАЛЬНЫЕ ПАТЧИ ---
 (BigInt.prototype as any).toJSON = function () {
   return this.toString();
 };
@@ -21,20 +21,16 @@ const prisma = new PrismaClient();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './uploads';
-const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-change-me';
+const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key';
 const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(UPLOAD_DIR));
 
-// Расширение типов для Express
-declare global {
-  namespace Express {
-    interface Request {
-      user?: { id: number; tenant_id: number; role: string };
-    }
-  }
+// Интерфейс для расширения Request
+interface AuthRequest extends Request {
+  user?: { id: number; tenant_id: number; role: string };
 }
 
 // --- 3. UTILS ---
@@ -52,7 +48,7 @@ const formatInTimezone = (date: Date | null, timezone: string = 'Europe/Moscow')
   });
 };
 
-const authenticateJWT = (req: Request, res: Response, next: NextFunction) => {
+const authenticateJWT = (req: AuthRequest, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
   if (authHeader) {
     const token = authHeader.split(' ')[1];
@@ -113,6 +109,15 @@ class ShiftService {
     });
   }
 
+  async cancelShift(userId: number) {
+    await prisma.$transaction(async (tx) => {
+      const shift = await tx.shifts.findFirst({ where: { user_id: userId, status: { not: 'finished' } }, orderBy: { id: 'desc' } });
+      if (shift?.truck_id) await tx.dict_trucks.update({ where: { id: shift.truck_id }, data: { is_busy: false } });
+      if (shift) await tx.shifts.delete({ where: { id: shift.id } });
+      await tx.users.update({ where: { id: userId }, data: { current_state: 'idle' } });
+    });
+  }
+
   async requestEndShift(userId: number) {
     return await prisma.$transaction(async (tx) => {
       const shift = await tx.shifts.findFirst({ where: { user_id: userId, status: 'active' }, include: { site: true, tenant: true } });
@@ -154,15 +159,6 @@ class ShiftService {
     });
   }
 
-  async cancelShift(userId: number) {
-    await prisma.$transaction(async (tx) => {
-      const shift = await tx.shifts.findFirst({ where: { user_id: userId, status: { not: 'finished' } }, orderBy: { id: 'desc' } });
-      if (shift?.truck_id) await tx.dict_trucks.update({ where: { id: shift.truck_id }, data: { is_busy: false } });
-      if (shift) await tx.shifts.delete({ where: { id: shift.id } });
-      await tx.users.update({ where: { id: userId }, data: { current_state: 'idle' } });
-    });
-  }
-
   private async finalizeShiftInternal(tx: any, shiftId: number) {
     const shift = await tx.shifts.findUnique({ where: { id: shiftId }, include: { user: true } });
     const endTime = new Date();
@@ -200,7 +196,7 @@ const GatewayController = {
 
       const timeStr = formatInTimezone(new Date(), user.tenant?.timezone);
       return res.json(GatewayController.formatResponse(
-        `${result?.message || "Выберите действие:"}\n\n🕒 ${timeStr}`,
+        `${result?.message || "Меню:"}\n\n🕒 ${timeStr}`,
         result?.buttons || [],
         user.current_state,
         activeShift?.id,
@@ -263,25 +259,29 @@ api.post('/users/set-menu-id', async (req, res) => {
 });
 
 api.post('/auth/onboard', async (req, res) => {
-  const { company_name, admin_name, email, password, timezone, tg_user_id } = req.body;
-  const hash = await bcrypt.hash(password, 10);
-  const plan = await prisma.plans.findFirst({ where: { code: 'free' } });
-  const result = await prisma.$transaction(async (tx) => {
-    const tenant = await tx.tenants.create({ data: { name: company_name, plan_id: plan!.id, timezone: timezone || 'Europe/Moscow' } });
-    const user = await tx.users.create({ data: { tenant_id: tenant.id, role: 'admin', full_name: admin_name, email, password_hash: hash, tg_user_id: tg_user_id ? BigInt(tg_user_id) : null, current_state: 'idle' } });
-    return { tenant, user };
-  });
-  res.json(result);
+  try {
+    const { company_name, admin_name, email, password, timezone, tg_user_id } = req.body;
+    const hash = await bcrypt.hash(password, 10);
+    const plan = await prisma.plans.findFirst({ where: { code: 'free' } });
+    const result = await prisma.$transaction(async (tx) => {
+      const tenant = await tx.tenants.create({ data: { name: company_name, plan_id: plan!.id, timezone: timezone || 'Europe/Moscow' } });
+      const user = await tx.users.create({ data: { tenant_id: tenant.id, role: 'admin', full_name: admin_name, email, password_hash: hash, tg_user_id: tg_user_id ? BigInt(tg_user_id) : null, current_state: 'idle' } });
+      return { tenant, user };
+    });
+    res.json(result);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
-api.get('/admin/stats', authenticateJWT, async (req: Request, res: Response) => {
-  const tid = req.user!.tenant_id;
-  const [active, trucks, photos] = await Promise.all([
-    prisma.shifts.count({ where: { tenant_id: tid, status: { not: 'finished' } } }),
-    prisma.dict_trucks.count({ where: { tenant_id: tid, is_busy: true } }),
-    prisma.shifts.count({ where: { tenant_id: tid, updated_at: { gte: new Date(Date.now() - 86400000) } } })
-  ]);
-  res.json({ activeShifts: active, busyTrucks: trucks, photos24h: photos });
+api.get('/admin/stats', authenticateJWT, async (req: AuthRequest, res: Response) => {
+  try {
+    const tid = req.user!.tenant_id;
+    const [active, trucks, photos] = await Promise.all([
+      prisma.shifts.count({ where: { tenant_id: tid, status: { not: 'finished' } } }),
+      prisma.dict_trucks.count({ where: { tenant_id: tid, is_busy: true } }),
+      prisma.shifts.count({ where: { tenant_id: tid, updated_at: { gte: new Date(Date.now() - 86400000) } } })
+    ]);
+    res.json({ activeShifts: active, busyTrucks: trucks, photos24h: photos });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.use('/api/v1', api);
