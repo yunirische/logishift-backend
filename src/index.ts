@@ -252,6 +252,18 @@ const GatewayController = {
       return { message: "⚠️ Вы не авторизованы. Используйте ссылку-приглашение." };
     }
 
+    if (data === 'GEN_INVITE') {
+      if (user.role !== 'admin' && user.role !== 'foreman') {
+        return { message: "🚫 У вас нет прав для этого действия." };
+      }
+      return await GatewayController.generateInviteLink(user);
+    }
+
+    // Кнопка возврата в меню
+    if (data === 'MENU') {
+      return await GatewayController.processText(user, '/start', activeShift);
+    }
+
     if (data === 'STATUS') {
       if (!activeShift) return { message: "У вас нет активной смены." };
       const timeStr = formatInTimezone(activeShift.start_time, user.tenant?.timezone);
@@ -335,22 +347,35 @@ const GatewayController = {
     if (!text) return { message: "Меню:" };
     const t = text.trim();
     
-    // Обработка /start с инвайт-кодом
+    // 1. Обработка регистрации по ссылке
     if (t.startsWith('/start ')) {
       const inviteCode = t.split(' ')[1];
       return await GatewayController.handleRegistration(user, inviteCode);
     }
 
-    // Если пользователь не зарегистрирован (нет tenant_id)
+    // 2. Если пользователь не зарегистрирован в БД (нет tenant_id)
     if (!user.tenant_id) {
       return { 
-        message: "⚠️ Доступ ограничен.\n\nПожалуйста, воспользуйтесь ссылкой-приглашением от вашего администратора для регистрации." 
+        message: "⚠️ Доступ ограничен.\n\nПожалуйста, воспользуйтесь ссылкой-приглашением от вашего администратора." 
       };
     }
 
     const tLower = t.toLowerCase();
     
+    // 3. Главное меню
     if (tLower === '/start' || tLower === 'меню') {
+      // Если это АДМИН
+      if (user.role === 'admin' || user.role === 'foreman') {
+        return {
+          message: `👨‍💼 Админ-панель: ${user.full_name}\nКомпания: ${user.tenant?.name}`,
+          buttons: [
+            [{ text: "✉️ Создать приглашение", callback_data: "GEN_INVITE" }],
+            [{ text: "📊 Статистика (в разработке)", callback_data: "STATS" }]
+          ]
+        };
+      }
+
+      // Если это ВОДИТЕЛЬ
       if (activeShift && activeShift.status === 'active') {
         return { 
           message: `👷 Смена активна!\n🚛 Машина: ${activeShift.truck?.name}\n📍 Объект: ${activeShift.site?.name}`, 
@@ -363,11 +388,44 @@ const GatewayController = {
       return { message: `Привет, ${user.full_name}!`, buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]] };
     }
 
+    // 4. Комментарий к активной смене
     if (user.current_state === 'active' && activeShift) {
       await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: t } });
       return { message: "✅ Комментарий обновлен." };
     }
-    return { message: "Используйте меню." };
+
+    return { message: "Используйте кнопки меню." };
+  },
+
+  // Добавьте эту функцию внутрь объекта GatewayController
+  async generateInviteLink(adminUser: any) {
+    try {
+      // Генерируем случайный код из 8 символов
+      const inviteCode = Math.random().toString(36).substring(2, 10).toUpperCase();
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + 7); // Ссылка живет 7 дней
+
+      await prisma.invites.create({
+        data: {
+          tenant_id: adminUser.tenant_id,
+          code: inviteCode,
+          expires_at: expiresAt,
+          status: 'pending'
+        }
+      });
+
+      // ЗАМЕНИТЕ 'YourBotName' на реальный username вашего бота без @
+      const botUsername = '@sift_test_bot'; 
+      const link = `https://t.me/${botUsername}?start=${inviteCode}`;
+
+      return {
+        message: `✉️ **Ссылка-приглашение для водителя:**\n\n\`${link}\`\n\n_Нажмите на ссылку, чтобы скопировать её. Перешлите её водителю. Она будет активна 7 дней._`,
+        buttons: [[{ text: "🔙 В меню", callback_data: "MENU" }]]
+      };
+    } catch (e: any) {
+      console.error('GENERATE INVITE ERROR:', e);
+      return { message: "❌ Не удалось создать приглашение." };
+    }
   },
 
   async handleRegistration(user: any, inviteCode: string) {
