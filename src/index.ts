@@ -247,35 +247,88 @@ const GatewayController = {
   },
 
   async processCallback(user: any, data: string, activeShift: any) {
+    // 0. Защита: если пользователя нет в БД, кнопки не работают (кроме регистрации)
+    if (!user.id) {
+      return { message: "⚠️ Вы не авторизованы. Используйте ссылку-приглашение." };
+    }
+
     if (data === 'STATUS') {
       if (!activeShift) return { message: "У вас нет активной смены." };
       const timeStr = formatInTimezone(activeShift.start_time, user.tenant?.timezone);
       return { 
-        message: `📄 *Ваша смена:*\n\n⏱ Начало: ${timeStr}\n🚛 Машина: ${activeShift.truck?.name}\n📍 Объект: ${activeShift.site?.name}`,
+        message: `📄 *Ваша смена:*\n\n⏱ Начало: ${timeStr}\n🚛 Машина: ${activeShift.truck?.name || '---'}\n📍 Объект: ${activeShift.site?.name || '---'}\n\nВы можете отправить текстовое сообщение, чтобы добавить комментарий к смене.`,
         buttons: [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]]
       };
     }
 
     if (data === 'START_SHIFT') {
+      // Проверка: а нет ли уже активной смены?
+      if (activeShift) return { message: "⚠️ У вас уже есть открытая смена!" };
+
       await shiftService.startShiftDraft(user.id);
-      const trucks = await prisma.dict_trucks.findMany({ where: { tenant_id: user.tenant_id, is_active: true, is_busy: false } });
-      return { message: "🚚 Выберите машину:", buttons: trucks.map(t => [{ text: t.name, callback_data: `TRK_${t.id}` }]) };
+      const trucks = await prisma.dict_trucks.findMany({ 
+        where: { tenant_id: user.tenant_id, is_active: true, is_busy: false } 
+      });
+
+      if (trucks.length === 0) {
+        return { 
+          message: "📭 Нет доступных машин. Обратитесь к механику или администратору.",
+          buttons: [[{ text: "🔄 Обновить список", callback_data: "START_SHIFT" }]]
+        };
+      }
+
+      const buttons = trucks.map(t => [{ text: `🚛 ${t.name} (${t.plate || ''})`, callback_data: `TRK_${t.id}` }]);
+      buttons.push([{ text: "❌ Отмена", callback_data: "CANCEL" }]);
+      
+      return { message: "Выбор машины:", buttons };
     }
+
     if (data.startsWith('TRK_')) {
-      await shiftService.selectTruck(user.id, parseId(data.split('_')[1]));
-      const sites = await prisma.dict_sites.findMany({ where: { tenant_id: user.tenant_id, is_active: true } });
-      return { message: "📍 Теперь объект:", buttons: sites.map(s => [{ text: s.name, callback_data: `STE_${s.id}` }]) };
+      try {
+        await shiftService.selectTruck(user.id, parseId(data.split('_')[1]));
+        const sites = await prisma.dict_sites.findMany({ 
+          where: { tenant_id: user.tenant_id, is_active: true } 
+        });
+
+        if (sites.length === 0) {
+          return { message: "⚠️ В системе нет активных объектов. Смена отменена.", buttons: [[{ text: "❌ Отмена", callback_data: "CANCEL" }]] };
+        }
+
+        const buttons = sites.map(s => [{ text: `📍 ${s.name}`, callback_data: `STE_${s.id}` }]);
+        buttons.push([{ text: "❌ Отмена (освободить машину)", callback_data: "CANCEL" }]);
+
+        return { message: "Машина выбрана. Теперь выберите объект:", buttons };
+      } catch (e: any) {
+        return { message: `❌ Ошибка: ${e.message}`, buttons: [[{ text: "🔄 Попробовать снова", callback_data: "START_SHIFT" }]] };
+      }
     }
+
     if (data.startsWith('STE_')) {
-      const res = await shiftService.selectSite(user.id, parseId(data.split('_')[1]));
-      return { 
-        message: res.odometerRequired ? "📸 Пришлите фото одометра (СТАРТ):" : "🚀 Смена открыта!", 
-        buttons: res.odometerRequired ? [] : [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]] 
-      };
+      try {
+        const res = await shiftService.selectSite(user.id, parseId(data.split('_')[1]));
+        const btns = res.odometerRequired ? [] : [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]];
+        return { 
+          message: res.odometerRequired 
+            ? "📸 Объект выбран. Теперь пришлите фото ОДОМЕТРА (старт):" 
+            : "🚀 Смена успешно открыта! Удачной работы.", 
+          buttons: btns 
+        };
+      } catch (e: any) {
+        return { message: `❌ Ошибка: ${e.message}`, buttons: [[{ text: "❌ Отмена", callback_data: "CANCEL" }]] };
+      }
     }
+
     if (data === 'END_SHIFT') return await shiftService.requestEndShift(user.id);
-    if (data === 'CANCEL') { await shiftService.cancelShift(user.id); return { message: "❌ Отменено." }; }
-    return { message: "Меню:" };
+
+    if (data === 'CANCEL') { 
+      await shiftService.cancelShift(user.id); 
+      return { 
+        message: "❌ Действие отменено. Машина освобождена.", 
+        buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]] 
+      }; 
+    }
+
+    return { message: "Неизвестная команда." };
   },
 
   async processText(user: any, text: string, activeShift: any) {
