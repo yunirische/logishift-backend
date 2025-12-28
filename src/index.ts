@@ -195,19 +195,26 @@ const GatewayController = {
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
 
     try {
-      const user = await prisma.users.findUnique({ 
+      let user = await prisma.users.findUnique({ 
         where: { tg_user_id: BigInt(user_id) }, 
         include: { tenant: true } 
       });
 
+      // Если пользователь не найден - создаем временный объект-заглушку
       if (!user) {
-        return res.json(GatewayController.formatResponse("⚠️ Вы не зарегистрированы в системе."));
+        user = { 
+          tg_user_id: BigInt(user_id), 
+          tenant_id: null, 
+          role: 'driver',
+          current_state: 'idle'
+        } as any;
       }
 
-      const activeShift = await prisma.shifts.findFirst({ 
+      // Активную смену ищем только если пользователь существует в БД
+      const activeShift = user?.id ? await prisma.shifts.findFirst({ 
         where: { user_id: user.id, status: { not: 'finished' } },
         include: { truck: true, site: true }
-      });
+      }) : null;
 
       let result: any;
 
@@ -273,9 +280,24 @@ const GatewayController = {
 
   async processText(user: any, text: string, activeShift: any) {
     if (!text) return { message: "Меню:" };
-    const t = text.trim().toLowerCase();
+    const t = text.trim();
     
-    if (t === '/start' || t === 'меню') {
+    // Обработка /start с инвайт-кодом
+    if (t.startsWith('/start ')) {
+      const inviteCode = t.split(' ')[1];
+      return await GatewayController.handleRegistration(user, inviteCode);
+    }
+
+    // Если пользователь не зарегистрирован (нет tenant_id)
+    if (!user.tenant_id) {
+      return { 
+        message: "⚠️ Доступ ограничен.\n\nПожалуйста, воспользуйтесь ссылкой-приглашением от вашего администратора для регистрации." 
+      };
+    }
+
+    const tLower = t.toLowerCase();
+    
+    if (tLower === '/start' || tLower === 'меню') {
       if (activeShift && activeShift.status === 'active') {
         return { 
           message: `👷 Смена активна!\n🚛 Машина: ${activeShift.truck?.name}\n📍 Объект: ${activeShift.site?.name}`, 
@@ -289,10 +311,72 @@ const GatewayController = {
     }
 
     if (user.current_state === 'active' && activeShift) {
-      await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: text } });
+      await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: t } });
       return { message: "✅ Комментарий обновлен." };
     }
     return { message: "Используйте меню." };
+  },
+
+  async handleRegistration(user: any, inviteCode: string) {
+    try {
+      // 1. Ищем активный инвайт по коду
+      const invite = await prisma.invites.findFirst({
+        where: { 
+          code: inviteCode,
+          status: 'pending',
+          expires_at: { gte: new Date() }
+        }
+      });
+
+      if (!invite) {
+        return { 
+          message: "❌ Код недействителен, уже использован или срок действия истек.\n\nОбратитесь к администратору за новой ссылкой." 
+        };
+      }
+
+      // 2. Проверяем, что этот tg_user_id еще не зарегистрирован
+      const existingUser = await prisma.users.findUnique({
+        where: { tg_user_id: user.tg_user_id }
+      });
+
+      if (existingUser) {
+        return { 
+          message: "⚠️ Вы уже зарегистрированы в системе.\n\nИспользуйте /start для доступа к меню." 
+        };
+      }
+
+      // 3. Создаем нового пользователя
+      await prisma.$transaction(async (tx) => {
+        // Создаем пользователя
+        await tx.users.create({
+          data: { 
+            tenant_id: invite.tenant_id,
+            role: 'driver',
+            tg_user_id: user.tg_user_id,
+            current_state: 'idle',
+            full_name: 'Новый водитель',
+            hourly_rate: 0
+          }
+        });
+
+        // Помечаем инвайт как использованный
+        await tx.invites.update({
+          where: { id: invite.id },
+          data: { status: 'used' }
+        });
+      });
+
+      return { 
+        message: `✅ Регистрация завершена!\n\nДобро пожаловать в систему. Теперь вы можете управлять сменами.\n\n⚙️ Администратор заполнит ваши данные (ФИО, ставка) в ближайшее время.`,
+        buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]]
+      };
+      
+    } catch (e: any) {
+      console.error('REGISTRATION ERROR:', e);
+      return { 
+        message: "❌ Произошла ошибка при регистрации.\n\nПопробуйте еще раз или обратитесь к администратору." 
+      };
+    }
   },
 
   formatResponse(text: string, buttons: any[] = [], state: string = 'idle', shiftId?: number, userInternalId?: number, lastMenuId?: string) {
