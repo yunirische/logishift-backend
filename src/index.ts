@@ -347,14 +347,14 @@ const GatewayController = {
     if (!text) return { message: "Меню:" };
     const t = text.trim();
     
-    // 1. Обработка регистрации по ссылке
+    // 1. Регистрация по коду
     if (t.startsWith('/start ')) {
       const inviteCode = t.split(' ')[1];
       return await GatewayController.handleRegistration(user, inviteCode);
     }
 
-    // 2. Если пользователь не зарегистрирован в БД (нет tenant_id)
-    if (!user.tenant_id) {
+    // 2. Если не зарегистрирован
+    if (!user.id || !user.tenant_id) {
       return { 
         message: "⚠️ Доступ ограничен.\n\nПожалуйста, воспользуйтесь ссылкой-приглашением от вашего администратора." 
       };
@@ -362,39 +362,36 @@ const GatewayController = {
 
     const tLower = t.toLowerCase();
     
-    // 3. Главное меню
     if (tLower === '/start' || tLower === 'меню') {
-      // Если это АДМИН
-      if (user.role === 'admin' || user.role === 'foreman') {
-        return {
-          message: `👨‍💼 Админ-панель: ${user.full_name}\nКомпания: ${user.tenant?.name}`,
-          buttons: [
-            [{ text: "✉️ Создать приглашение", callback_data: "GEN_INVITE" }],
-            [{ text: "📊 Статистика (в разработке)", callback_data: "STATS" }]
-          ]
-        };
+      const buttons = [];
+
+      // Кнопки водителя (видят все)
+      if (activeShift && activeShift.status === 'active') {
+        buttons.push([{ text: "📊 Статус смены", callback_data: "STATUS" }]);
+        buttons.push([{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]);
+      } else {
+        buttons.push([{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]);
       }
 
-      // Если это ВОДИТЕЛЬ
-      if (activeShift && activeShift.status === 'active') {
-        return { 
-          message: `👷 Смена активна!\n🚛 Машина: ${activeShift.truck?.name}\n📍 Объект: ${activeShift.site?.name}`, 
-          buttons: [
-            [{ text: "📊 Статус", callback_data: "STATUS" }],
-            [{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]
-          ] 
-        };
+      // Кнопки админа (добавляем в конец, если роль позволяет)
+      if (user.role === 'admin' || user.role === 'foreman') {
+        buttons.push([{ text: "✉️ Создать приглашение", callback_data: "GEN_INVITE" }]);
+        // buttons.push([{ text: "📈 Отчеты", callback_data: "REPORTS" }]); // На будущее
       }
-      return { message: `Привет, ${user.full_name}!`, buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]] };
+
+      return { 
+        message: `Привет, ${user.full_name || 'Пользователь'}!\n\nВы в главном меню. Выберите действие:`, 
+        buttons 
+      };
     }
 
-    // 4. Комментарий к активной смене
+    // 3. Сохранение комментария
     if (user.current_state === 'active' && activeShift) {
       await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: t } });
-      return { message: "✅ Комментарий обновлен." };
+      return { message: "✅ Комментарий к смене сохранен." };
     }
 
-    return { message: "Используйте кнопки меню." };
+    return { message: "Используйте кнопки меню для управления." };
   },
 
   // Добавьте эту функцию внутрь объекта GatewayController
@@ -415,7 +412,7 @@ const GatewayController = {
       });
 
       // ЗАМЕНИТЕ 'YourBotName' на реальный username вашего бота без @
-      const botUsername = '@sift_test_bot'; 
+      const botUsername = 'sift_test_bot'; 
       const link = `https://t.me/${botUsername}?start=${inviteCode}`;
 
       return {
@@ -430,7 +427,7 @@ const GatewayController = {
 
   async handleRegistration(user: any, inviteCode: string) {
     try {
-      // 1. Ищем активный инвайт по коду
+      // Ищем инвайт
       const invite = await prisma.invites.findFirst({
         where: { 
           code: inviteCode,
@@ -440,37 +437,25 @@ const GatewayController = {
       });
 
       if (!invite) {
-        return { 
-          message: "❌ Код недействителен, уже использован или срок действия истек.\n\nОбратитесь к администратору за новой ссылкой." 
-        };
+        return { message: "❌ Код недействителен или просрочен." };
       }
 
-      // 2. Проверяем, что этот tg_user_id еще не зарегистрирован
-      const existingUser = await prisma.users.findUnique({
-        where: { tg_user_id: user.tg_user_id }
-      });
+      // Проверка на дубликат (если этот человек уже есть)
+      const checkUser = await prisma.users.findUnique({ where: { tg_user_id: user.tg_user_id } });
+      if (checkUser) return { message: "⚠️ Вы уже зарегистрированы." };
 
-      if (existingUser) {
-        return { 
-          message: "⚠️ Вы уже зарегистрированы в системе.\n\nИспользуйте /start для доступа к меню." 
-        };
-      }
-
-      // 3. Создаем нового пользователя
+      // Создаем пользователя
       await prisma.$transaction(async (tx) => {
-        // Создаем пользователя
         await tx.users.create({
           data: { 
             tenant_id: invite.tenant_id,
             role: 'driver',
             tg_user_id: user.tg_user_id,
             current_state: 'idle',
-            full_name: 'Новый водитель',
-            hourly_rate: 0
+            full_name: 'Новый водитель'
           }
         });
 
-        // Помечаем инвайт как использованный
         await tx.invites.update({
           where: { id: invite.id },
           data: { status: 'used' }
@@ -478,15 +463,13 @@ const GatewayController = {
       });
 
       return { 
-        message: `✅ Регистрация завершена!\n\nДобро пожаловать в систему. Теперь вы можете управлять сменами.\n\n⚙️ Администратор заполнит ваши данные (ФИО, ставка) в ближайшее время.`,
+        message: "✅ Регистрация прошла успешно!\n\nТеперь вы можете начать свою первую смену.",
         buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]]
       };
       
     } catch (e: any) {
       console.error('REGISTRATION ERROR:', e);
-      return { 
-        message: "❌ Произошла ошибка при регистрации.\n\nПопробуйте еще раз или обратитесь к администратору." 
-      };
+      return { message: "❌ Ошибка регистрации." };
     }
   },
 
@@ -506,9 +489,22 @@ api.post('/gateway', GatewayController.handleWebhook);
 api.post('/users/set-menu-id', async (req, res) => {
   try {
     const { user_id, message_id } = req.body;
-    await prisma.users.update({ where: { id: parseId(user_id) }, data: { last_menu_message_id: BigInt(message_id) } });
+    const uid = parseInt(user_id);
+    
+    // Если пользователь еще не зарегистрирован (ID 0 или NaN), просто отвечаем "ОК" без ошибки
+    if (!uid || isNaN(uid)) {
+      return res.json({ success: true, note: 'User not registered yet, skipping' });
+    }
+
+    await prisma.users.update({ 
+      where: { id: uid }, 
+      data: { last_menu_message_id: BigInt(message_id) } 
+    });
     res.json({ success: true });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  } catch (e: any) { 
+    console.error('SET MENU ID ERROR:', e);
+    res.status(500).json({ error: e.message }); 
+  }
 });
 
 api.post('/auth/onboard', async (req, res) => {
