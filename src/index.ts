@@ -246,123 +246,197 @@ const GatewayController = {
     }
   },
 
-  async processCallback(user: any, data: string, activeShift: any) {
-    if (!user.id) return { message: "⚠️ Вы не авторизованы." };
+renderDriverStatus(user: any, activeShift: any) {
+    let text = `🚗 **МЕНЮ ВОДИТЕЛЯ**\n`;
+    text += `────────────────────\n`;
 
-    // Админские функции
-    if (data === 'GEN_INVITE') return await GatewayController.generateInviteLink(user);
-    if (data === 'MENU') return await GatewayController.processText(user, '/start', activeShift);
-
-    // Начало смены
-    if (data === 'START_SHIFT') {
-      if (activeShift) return { message: "⚠️ Смена уже запущена!" };
-      
-      await shiftService.startShiftDraft(user.id);
-      const trucks = await prisma.dict_trucks.findMany({ 
-        where: { tenant_id: user.tenant_id, is_active: true, is_busy: false } 
-      });
-
-      if (trucks.length === 0) return { message: "📭 Нет доступных машин.", buttons: [[{ text: "🔄 Обновить", callback_data: "START_SHIFT" }]] };
-      
-      const buttons = trucks.map(t => [{ text: `🚛 ${t.name}`, callback_data: `TRK_${t.id}` }]);
-      buttons.push([{ text: "❌ Отмена", callback_data: "CANCEL" }]);
-      return { message: "🚚 **Выбор машины:**", buttons };
+    if (!activeShift) {
+      text += `Состояние: 💤 **Отдых**\n`;
+      text += `У вас нет активной смены. Чтобы начать работу, нажмите кнопку ниже.`;
+      return { text, buttons: [[{ text: "✅ Начать смену", callback_data: "START_SHIFT" }]] };
     }
 
-    // Выбор машины -> Выбор объекта
+    // Формируем индикаторы фото
+    const checkStart = activeShift.photo_start_url ? "✅" : (user.current_state === 'awaiting_odo_start' ? "⏳" : "❌");
+    const checkEnd = activeShift.photo_end_url ? "✅" : (user.current_state === 'awaiting_odo_end' ? "⏳" : "❌");
+    const checkInv = activeShift.photo_invoice_url ? "✅" : (user.current_state === 'awaiting_invoice' ? "⏳" : "❌");
+
+    const timeStr = formatInTimezone(activeShift.start_time, user.tenant?.timezone);
+
+    text += `👷 **В РАБОТЕ**\n`;
+    text += `⏱ **Старт:** ${timeStr}\n`;
+    text += `🚛 **Машина:** ${activeShift.truck?.name || '---'}\n`;
+    text += `📍 **Объект:** ${activeShift.site?.name || '---'}\n`;
+    text += `────────────────────\n`;
+    text += `📸 **ФОТООТЧЕТ:**\n`;
+    text += `Одометр [S]: ${checkStart} | [F]: ${checkEnd} | Чек: ${checkInv}\n`;
+
+    if (activeShift.comment) {
+      text += `────────────────────\n`;
+      text += `💬 **Комментарий:** ${activeShift.comment}\n`;
+    }
+
+    const buttons = [];
+    if (activeShift.status === 'active') {
+      buttons.push([{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]);
+      buttons.push([{ text: "📝 Добавить комментарий", callback_data: "ADD_COMMENT" }]);
+    } else {
+      text += `\n⚠️ **Ожидание действия:** Пришлите фото!`;
+      buttons.push([{ text: "❌ Отменить черновик", callback_data: "CANCEL" }]);
+    }
+    
+    // Если это админ, добавим кнопку возврата в админку
+    if (user.role === 'admin' || user.role === 'foreman') {
+      buttons.push([{ text: "⚙️ Вернуться в Админ-панель", callback_data: "ADMIN_MAIN" }]);
+    }
+
+    return { text, buttons };
+  },
+
+  async renderAdminPanel(user: any) {
+    const tid = user.tenant_id;
+    
+    // Собираем быструю статистику
+    const [activeShifts, busyTrucks, usersCount] = await Promise.all([
+      prisma.shifts.count({ where: { tenant_id: tid, status: { not: 'finished' } } }),
+      prisma.dict_trucks.count({ where: { tenant_id: tid, is_busy: true } }),
+      prisma.users.count({ where: { tenant_id: tid } })
+    ]);
+
+    let text = `👨‍💼 **ПАНЕЛЬ УПРАВЛЕНИЯ**\n`;
+    text += `Компания: **${user.tenant?.name}**\n`;
+    text += `────────────────────\n`;
+    
+    const buttons = [
+      [
+        { text: `🟢 Смены (${activeShifts})`, callback_data: "VIEW_ACTIVE" },
+        { text: `👷 Онлайн (${activeShifts})`, callback_data: "VIEW_ONLINE" }
+      ],
+      [{ text: `🖼 Фото за 24ч (---)`, callback_data: "VIEW_PHOTOS" }],
+      [{ text: "➕ Создать смену за водителя", callback_data: "MANUAL_SHIFT" }],
+      [{ text: "⚙️ Управление системой", callback_data: "ADMIN_SETTINGS" }],
+      [{ text: "🚗 Перейти в режим водителя", callback_data: "DRIVER_MENU" }]
+    ];
+
+    return { text, buttons };
+  },
+
+  async renderAdminSettings(user: any) {
+    const tid = user.tenant_id;
+    const usersCount = await prisma.users.count({ where: { tenant_id: tid } });
+
+    let text = `🛠 **УПРАВЛЕНИЕ СИСТЕМОЙ**\n`;
+    text += `Настройте справочники и параметры компании.`;
+
+    const buttons = [
+      [
+        { text: `👥 Пользователи (${usersCount})`, callback_data: "GEN_INVITE" }, // Пока ведем на инвайт
+        { text: `📦 Архив смен`, callback_data: "REPORTS" }
+      ],
+      [
+        { text: `🚛 Машины`, callback_data: "EDIT_TRUCKS" },
+        { text: `📍 Объекты`, callback_data: "EDIT_SITES" }
+      ],
+      [
+        { text: `📊 Отчеты`, callback_data: "REPORTS" },
+        { text: `🌍 Часовой пояс`, callback_data: "SET_TZ" }
+      ],
+      [{ text: `💳 Тариф: Бесплатный`, callback_data: "BILLING" }],
+      [{ text: "⬅️ Назад в панель", callback_data: "ADMIN_MAIN" }]
+    ];
+
+    return { text, buttons };
+  },
+
+
+
+  async processCallback(user: any, data: string, activeShift: any) {
+    if (!user.id) return { message: "⚠️ Ошибка авторизации." };
+
+    // --- Навигация ---
+    if (data === 'ADMIN_MAIN') return await GatewayController.renderAdminPanel(user);
+    if (data === 'ADMIN_SETTINGS') return await GatewayController.renderAdminSettings(user);
+    if (data === 'DRIVER_MENU') return GatewayController.renderDriverStatus(user, activeShift);
+    
+    // --- Логика Водителя ---
+    if (data === 'START_SHIFT') {
+      if (activeShift) return { message: "⚠️ Смена уже идет." };
+      await shiftService.startShiftDraft(user.id);
+      const trucks = await prisma.dict_trucks.findMany({ where: { tenant_id: user.tenant_id, is_active: true, is_busy: false } });
+      return { 
+        message: "🚚 **ВЫБОР МАШИНЫ**\nВыберите транспорт из списка:", 
+        buttons: [...trucks.map(t => [{ text: `🚛 ${t.name}`, callback_data: `TRK_${t.id}` }]), [{ text: "❌ Отмена", callback_data: "CANCEL" }]]
+      };
+    }
+    
     if (data.startsWith('TRK_')) {
       await shiftService.selectTruck(user.id, parseId(data.split('_')[1]));
       const sites = await prisma.dict_sites.findMany({ where: { tenant_id: user.tenant_id, is_active: true } });
-      
-      const buttons = sites.map(s => [{ text: `📍 ${s.name}`, callback_data: `STE_${s.id}` }]);
-      buttons.push([{ text: "❌ Отмена", callback_data: "CANCEL" }]);
-      return { message: "📍 **Выберите рабочий объект:**", buttons };
-    }
-
-    // Выбор объекта -> Финиш оформления
-    if (data.startsWith('STE_')) {
-      const res = await shiftService.selectSite(user.id, parseId(data.split('_')[1]));
       return { 
-        message: res.odometerRequired ? "📸 Пришлите фото одометра (СТАРТ):" : "🚀 Смена успешно открыта!", 
-        buttons: res.odometerRequired ? [] : [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]] 
+        message: "📍 **ВЫБОР ОБЪЕКТА**\nГде сегодня работаем?", 
+        buttons: [...sites.map(s => [{ text: `📍 ${s.name}`, callback_data: `STE_${s.id}` }]), [{ text: "❌ Отмена", callback_data: "CANCEL" }]]
       };
     }
 
-    // Статус и Завершение
-    if (data === 'STATUS') return await GatewayController.processText(user, '/start', activeShift);
-    if (data === 'END_SHIFT') return await shiftService.requestEndShift(user.id);
-    
-    // ОТМЕНА (сброс всего)
-    if (data === 'CANCEL') { 
-      await shiftService.cancelShift(user.id); 
-      return { 
-        message: "❌ Действие отменено. Машина освобождена.", 
-        buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]] 
-      }; 
+    if (data.startsWith('STE_')) {
+      const res = await shiftService.selectSite(user.id, parseId(data.split('_')[1]));
+      return GatewayController.renderDriverStatus(user, await prisma.shifts.findFirst({ where: { user_id: user.id, status: { not: 'finished' } } }));
     }
 
-    return { message: "Неизвестное действие." };
+    if (data === 'END_SHIFT') return await shiftService.requestEndShift(user.id);
+    if (data === 'CANCEL') { await shiftService.cancelShift(user.id); return GatewayController.renderDriverStatus(user, null); }
+    
+    // --- Логика Админа ---
+    if (data === 'GEN_INVITE') return await GatewayController.generateInviteLink(user);
+    
+    // Заглушки
+    if (['REPORTS', 'VIEW_ACTIVE', 'VIEW_ONLINE', 'VIEW_PHOTOS', 'MANUAL_SHIFT', 'EDIT_TRUCKS', 'EDIT_SITES', 'SET_TZ', 'BILLING'].includes(data)) {
+      return { message: "⏳ Этот раздел сейчас находится в разработке и будет доступен в WebApp.", buttons: [[{ text: "⬅️ Назад", callback_data: "ADMIN_SETTINGS" }]] };
+    }
+
+    return { message: "Команда получена: " + data };
   },
 
   async processText(user: any, text: string, activeShift: any) {
     if (!text) return { message: "Меню:" };
     const t = text.trim();
     
-    // Обработка входа по ссылке
+    // 1. Регистрация по ссылке (всегда высший приоритет)
     if (t.startsWith('/start ')) {
       const inviteCode = t.split(' ')[1];
       return await GatewayController.handleRegistration(user, inviteCode);
     }
 
-    // Если пользователь не привязан к компании (не зарегистрирован)
+    // 2. Проверка авторизации
     if (!user.id || !user.tenant_id) {
-      return { 
-        message: "⚠️ Доступ ограничен.\n\nПожалуйста, воспользуйтесь ссылкой-приглашением от вашего администратора." 
-      };
+      return { message: "⚠️ Доступ ограничен. Нужна ссылка-приглашение." };
     }
 
     const tLower = t.toLowerCase();
     
-    // ГЛАВНОЕ МЕНЮ (/start или Меню)
-    if (tLower === '/start' || tLower === 'меню') {
-      const buttons: any[][] = [];
-      let statusText = `Привет, ${user.full_name || 'Пользователь'}!`;
-
-      // --- БЛОК ВОДИТЕЛЯ (видят все: и водители, и админы для тестов) ---
-      if (activeShift) {
-        const timeStr = formatInTimezone(activeShift.start_time, user.tenant?.timezone);
-        statusText = `👷 **Смена активна!**\n\n⏱ Старт: ${timeStr}\n🚛 Машина: ${activeShift.truck?.name || '---'}\n📍 Объект: ${activeShift.site?.name || '---'}`;
-        
-        if (activeShift.status === 'active') {
-          buttons.push([{ text: "📊 Статус", callback_data: "STATUS" }]);
-          buttons.push([{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]);
-        } else {
-          // Если смена в процессе оформления (ждем одометр или фото)
-          statusText = `⚠️ **Смена в процессе оформления**\n\nТекущий шаг: ${user.current_state}`;
-          buttons.push([{ text: "❌ Отменить черновик", callback_data: "CANCEL" }]);
-        }
-      } else {
-        statusText += `\n\nУ вас нет активной смены. Желаете начать?`;
-        buttons.push([{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]);
+    // 3. Команда АДМИН (Панель управления)
+    if (tLower === '/admin') {
+      if (user.role !== 'admin' && user.role !== 'foreman') {
+        return { message: "🚫 У вас нет прав администратора." };
       }
-
-      // --- БЛОК АДМИНА (только для admin/foreman) ---
-      if (user.role === 'admin' || user.role === 'foreman') {
-        buttons.push([{ text: "──────────────", callback_data: "NONE" }]); // Разделитель
-        buttons.push([{ text: "✉️ Создать приглашение", callback_data: "GEN_INVITE" }]);
-        buttons.push([{ text: "📈 Отчеты (WebApp)", url: "https://pwa.kontrolsmen.ru" }]); 
-      }
-
-      return { message: statusText, buttons };
+      return await GatewayController.renderAdminPanel(user);
     }
 
-    // Обработка текстового комментария (если смена активна)
+    // 4. Команда ВОДИТЕЛЬ или СТАРТ (Личный кабинет водителя)
+    if (tLower === '/driver' || tLower === '/start' || tLower === 'меню') {
+      return GatewayController.renderDriverStatus(user, activeShift);
+    }
+
+    // 5. Если просто прислали текст при активной смене — это комментарий
     if (user.current_state === 'active' && activeShift) {
       await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: t } });
-      return { message: "✅ Комментарий к смене обновлен." };
+      // После сохранения комментария возвращаем водителя в его меню
+      const updatedShift = await prisma.shifts.findUnique({ where: { id: activeShift.id }, include: { truck: true, site: true } });
+      const response = GatewayController.renderDriverStatus(user, updatedShift);
+      return { ...response, message: "✅ Комментарий сохранен!\n\n" + response.text };
     }
 
-    return { message: "Используйте кнопки меню для управления системой." };
+    return { message: "❓ Неизвестная команда. Используйте /driver или /admin." };
   },
 
   // Добавьте эту функцию внутрь объекта GatewayController
