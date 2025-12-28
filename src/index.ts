@@ -247,91 +247,52 @@ const GatewayController = {
   },
 
   async processCallback(user: any, data: string, activeShift: any) {
-    // 0. Защита: если пользователя нет в БД, кнопки не работают (кроме регистрации)
-    if (!user.id) {
-      return { message: "⚠️ Вы не авторизованы. Используйте ссылку-приглашение." };
-    }
+    if (!user.id) return { message: "⚠️ Вы не авторизованы." };
 
-    if (data === 'GEN_INVITE') {
-      if (user.role !== 'admin' && user.role !== 'foreman') {
-        return { message: "🚫 У вас нет прав для этого действия." };
-      }
-      return await GatewayController.generateInviteLink(user);
-    }
+    // Админские функции
+    if (data === 'GEN_INVITE') return await GatewayController.generateInviteLink(user);
+    if (data === 'MENU') return await GatewayController.processText(user, '/start', activeShift);
 
-    // Кнопка возврата в меню
-    if (data === 'MENU') {
-      return await GatewayController.processText(user, '/start', activeShift);
-    }
-
-    if (data === 'STATUS') {
-      if (!activeShift) return { message: "У вас нет активной смены." };
-      const timeStr = formatInTimezone(activeShift.start_time, user.tenant?.timezone);
-      return { 
-        message: `📄 *Ваша смена:*\n\n⏱ Начало: ${timeStr}\n🚛 Машина: ${activeShift.truck?.name || '---'}\n📍 Объект: ${activeShift.site?.name || '---'}\n\nВы можете отправить текстовое сообщение, чтобы добавить комментарий к смене.`,
-        buttons: [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]]
-      };
-    }
-
+    // Начало смены
     if (data === 'START_SHIFT') {
-      // Проверка: а нет ли уже активной смены?
-      if (activeShift) return { message: "⚠️ У вас уже есть открытая смена!" };
-
+      if (activeShift) return { message: "⚠️ Смена уже запущена!" };
+      
       await shiftService.startShiftDraft(user.id);
       const trucks = await prisma.dict_trucks.findMany({ 
         where: { tenant_id: user.tenant_id, is_active: true, is_busy: false } 
       });
 
-      if (trucks.length === 0) {
-        return { 
-          message: "📭 Нет доступных машин. Обратитесь к механику или администратору.",
-          buttons: [[{ text: "🔄 Обновить список", callback_data: "START_SHIFT" }]]
-        };
-      }
-
-      const buttons = trucks.map(t => [{ text: `🚛 ${t.name} (${t.plate || ''})`, callback_data: `TRK_${t.id}` }]);
-      buttons.push([{ text: "❌ Отмена", callback_data: "CANCEL" }]);
+      if (trucks.length === 0) return { message: "📭 Нет доступных машин.", buttons: [[{ text: "🔄 Обновить", callback_data: "START_SHIFT" }]] };
       
-      return { message: "Выбор машины:", buttons };
+      const buttons = trucks.map(t => [{ text: `🚛 ${t.name}`, callback_data: `TRK_${t.id}` }]);
+      buttons.push([{ text: "❌ Отмена", callback_data: "CANCEL" }]);
+      return { message: "🚚 **Выбор машины:**", buttons };
     }
 
+    // Выбор машины -> Выбор объекта
     if (data.startsWith('TRK_')) {
-      try {
-        await shiftService.selectTruck(user.id, parseId(data.split('_')[1]));
-        const sites = await prisma.dict_sites.findMany({ 
-          where: { tenant_id: user.tenant_id, is_active: true } 
-        });
-
-        if (sites.length === 0) {
-          return { message: "⚠️ В системе нет активных объектов. Смена отменена.", buttons: [[{ text: "❌ Отмена", callback_data: "CANCEL" }]] };
-        }
-
-        const buttons = sites.map(s => [{ text: `📍 ${s.name}`, callback_data: `STE_${s.id}` }]);
-        buttons.push([{ text: "❌ Отмена (освободить машину)", callback_data: "CANCEL" }]);
-
-        return { message: "Машина выбрана. Теперь выберите объект:", buttons };
-      } catch (e: any) {
-        return { message: `❌ Ошибка: ${e.message}`, buttons: [[{ text: "🔄 Попробовать снова", callback_data: "START_SHIFT" }]] };
-      }
+      await shiftService.selectTruck(user.id, parseId(data.split('_')[1]));
+      const sites = await prisma.dict_sites.findMany({ where: { tenant_id: user.tenant_id, is_active: true } });
+      
+      const buttons = sites.map(s => [{ text: `📍 ${s.name}`, callback_data: `STE_${s.id}` }]);
+      buttons.push([{ text: "❌ Отмена", callback_data: "CANCEL" }]);
+      return { message: "📍 **Выберите рабочий объект:**", buttons };
     }
 
+    // Выбор объекта -> Финиш оформления
     if (data.startsWith('STE_')) {
-      try {
-        const res = await shiftService.selectSite(user.id, parseId(data.split('_')[1]));
-        const btns = res.odometerRequired ? [] : [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]];
-        return { 
-          message: res.odometerRequired 
-            ? "📸 Объект выбран. Теперь пришлите фото ОДОМЕТРА (старт):" 
-            : "🚀 Смена успешно открыта! Удачной работы.", 
-          buttons: btns 
-        };
-      } catch (e: any) {
-        return { message: `❌ Ошибка: ${e.message}`, buttons: [[{ text: "❌ Отмена", callback_data: "CANCEL" }]] };
-      }
+      const res = await shiftService.selectSite(user.id, parseId(data.split('_')[1]));
+      return { 
+        message: res.odometerRequired ? "📸 Пришлите фото одометра (СТАРТ):" : "🚀 Смена успешно открыта!", 
+        buttons: res.odometerRequired ? [] : [[{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]] 
+      };
     }
 
+    // Статус и Завершение
+    if (data === 'STATUS') return await GatewayController.processText(user, '/start', activeShift);
     if (data === 'END_SHIFT') return await shiftService.requestEndShift(user.id);
-
+    
+    // ОТМЕНА (сброс всего)
     if (data === 'CANCEL') { 
       await shiftService.cancelShift(user.id); 
       return { 
@@ -340,20 +301,20 @@ const GatewayController = {
       }; 
     }
 
-    return { message: "Неизвестная команда." };
+    return { message: "Неизвестное действие." };
   },
 
   async processText(user: any, text: string, activeShift: any) {
     if (!text) return { message: "Меню:" };
     const t = text.trim();
     
-    // 1. Регистрация по коду
+    // Обработка входа по ссылке
     if (t.startsWith('/start ')) {
       const inviteCode = t.split(' ')[1];
       return await GatewayController.handleRegistration(user, inviteCode);
     }
 
-    // 2. Если не зарегистрирован
+    // Если пользователь не привязан к компании (не зарегистрирован)
     if (!user.id || !user.tenant_id) {
       return { 
         message: "⚠️ Доступ ограничен.\n\nПожалуйста, воспользуйтесь ссылкой-приглашением от вашего администратора." 
@@ -362,36 +323,46 @@ const GatewayController = {
 
     const tLower = t.toLowerCase();
     
+    // ГЛАВНОЕ МЕНЮ (/start или Меню)
     if (tLower === '/start' || tLower === 'меню') {
-      const buttons = [];
+      const buttons: any[][] = [];
+      let statusText = `Привет, ${user.full_name || 'Пользователь'}!`;
 
-      // Кнопки водителя (видят все)
-      if (activeShift && activeShift.status === 'active') {
-        buttons.push([{ text: "📊 Статус смены", callback_data: "STATUS" }]);
-        buttons.push([{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]);
+      // --- БЛОК ВОДИТЕЛЯ (видят все: и водители, и админы для тестов) ---
+      if (activeShift) {
+        const timeStr = formatInTimezone(activeShift.start_time, user.tenant?.timezone);
+        statusText = `👷 **Смена активна!**\n\n⏱ Старт: ${timeStr}\n🚛 Машина: ${activeShift.truck?.name || '---'}\n📍 Объект: ${activeShift.site?.name || '---'}`;
+        
+        if (activeShift.status === 'active') {
+          buttons.push([{ text: "📊 Статус", callback_data: "STATUS" }]);
+          buttons.push([{ text: "🏁 Завершить смену", callback_data: "END_SHIFT" }]);
+        } else {
+          // Если смена в процессе оформления (ждем одометр или фото)
+          statusText = `⚠️ **Смена в процессе оформления**\n\nТекущий шаг: ${user.current_state}`;
+          buttons.push([{ text: "❌ Отменить черновик", callback_data: "CANCEL" }]);
+        }
       } else {
+        statusText += `\n\nУ вас нет активной смены. Желаете начать?`;
         buttons.push([{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]);
       }
 
-      // Кнопки админа (добавляем в конец, если роль позволяет)
+      // --- БЛОК АДМИНА (только для admin/foreman) ---
       if (user.role === 'admin' || user.role === 'foreman') {
+        buttons.push([{ text: "──────────────", callback_data: "NONE" }]); // Разделитель
         buttons.push([{ text: "✉️ Создать приглашение", callback_data: "GEN_INVITE" }]);
-        // buttons.push([{ text: "📈 Отчеты", callback_data: "REPORTS" }]); // На будущее
+        buttons.push([{ text: "📈 Отчеты (WebApp)", url: "https://pwa.kontrolsmen.ru" }]); 
       }
 
-      return { 
-        message: `Привет, ${user.full_name || 'Пользователь'}!\n\nВы в главном меню. Выберите действие:`, 
-        buttons 
-      };
+      return { message: statusText, buttons };
     }
 
-    // 3. Сохранение комментария
+    // Обработка текстового комментария (если смена активна)
     if (user.current_state === 'active' && activeShift) {
       await prisma.shifts.update({ where: { id: activeShift.id }, data: { comment: t } });
-      return { message: "✅ Комментарий к смене сохранен." };
+      return { message: "✅ Комментарий к смене обновлен." };
     }
 
-    return { message: "Используйте кнопки меню для управления." };
+    return { message: "Используйте кнопки меню для управления системой." };
   },
 
   // Добавьте эту функцию внутрь объекта GatewayController
@@ -427,7 +398,7 @@ const GatewayController = {
 
   async handleRegistration(user: any, inviteCode: string) {
     try {
-      // Ищем инвайт
+      // 1. Ищем инвайт в БД
       const invite = await prisma.invites.findFirst({
         where: { 
           code: inviteCode,
@@ -437,25 +408,45 @@ const GatewayController = {
       });
 
       if (!invite) {
-        return { message: "❌ Код недействителен или просрочен." };
+        return { message: "❌ Код недействителен, использован или просрочен." };
       }
 
-      // Проверка на дубликат (если этот человек уже есть)
-      const checkUser = await prisma.users.findUnique({ where: { tg_user_id: user.tg_user_id } });
-      if (checkUser) return { message: "⚠️ Вы уже зарегистрированы." };
+      // 2. Ищем, есть ли уже такой пользователь в базе (мог зайти без кода ранее)
+      const existingUser = await prisma.users.findUnique({
+        where: { tg_user_id: user.tg_user_id }
+      });
 
-      // Создаем пользователя
+      if (existingUser && existingUser.tenant_id) {
+        return { message: "⚠️ Вы уже зарегистрированы в системе." };
+      }
+
+      // 3. Активируем регистрацию
       await prisma.$transaction(async (tx) => {
-        await tx.users.create({
-          data: { 
-            tenant_id: invite.tenant_id,
-            role: 'driver',
-            tg_user_id: user.tg_user_id,
-            current_state: 'idle',
-            full_name: 'Новый водитель'
-          }
-        });
+        if (existingUser) {
+          // ОБНОВЛЯЕМ существующую "пустышку"
+          await tx.users.update({
+            where: { id: existingUser.id },
+            data: { 
+              tenant_id: invite.tenant_id,
+              role: 'driver',
+              current_state: 'idle',
+              full_name: 'Новый водитель' 
+            }
+          });
+        } else {
+          // СОЗДАЕМ нового, если его нет
+          await tx.users.create({
+            data: { 
+              tenant_id: invite.tenant_id,
+              role: 'driver',
+              tg_user_id: user.tg_user_id,
+              current_state: 'idle',
+              full_name: 'Новый водитель'
+            }
+          });
+        }
 
+        // Помечаем инвайт как использованный
         await tx.invites.update({
           where: { id: invite.id },
           data: { status: 'used' }
@@ -463,13 +454,13 @@ const GatewayController = {
       });
 
       return { 
-        message: "✅ Регистрация прошла успешно!\n\nТеперь вы можете начать свою первую смену.",
+        message: "✅ Регистрация завершена успешно!\n\nТеперь вам доступны функции управления сменами.",
         buttons: [[{ text: "🚀 Начать смену", callback_data: "START_SHIFT" }]]
       };
       
     } catch (e: any) {
       console.error('REGISTRATION ERROR:', e);
-      return { message: "❌ Ошибка регистрации." };
+      return { message: "❌ Ошибка при регистрации. Попробуйте позже." };
     }
   },
 
