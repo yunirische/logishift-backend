@@ -338,6 +338,99 @@ const GatewayController = {
     return { message: text, buttons };
   },
 
+  async renderActiveShifts(user: any) {
+    const shifts = await prisma.shifts.findMany({
+      where: { tenant_id: user.tenant_id, status: { not: 'finished' } },
+      include: { user: true, truck: true, site: true },
+      orderBy: { start_time: 'desc' }
+    });
+
+    let text = `🟢 **АКТИВНЫЕ СМЕНЫ**\n`;
+    text += `────────────────────\n\n`;
+
+    if (shifts.length === 0) {
+      text += `Сейчас нет открытых смен.`;
+    } else {
+      shifts.forEach((s, i) => {
+        const time = formatInTimezone(s.start_time, user.tenant?.timezone);
+        text += `${i + 1}. **${s.user.full_name}**\n`;
+        text += `   🚛 ${s.truck?.name || '---'} | 📍 ${s.site?.name || '---'}\n`;
+        text += `   ⏱ Старт: ${time}\n\n`;
+      });
+    }
+
+    return { 
+      message: text, 
+      buttons: [[{ text: "⬅️ Назад", callback_data: "ADMIN_MAIN" }]] 
+    };
+  },
+
+  async renderFleetList(user: any) {
+    const trucks = await prisma.dict_trucks.findMany({
+      where: { tenant_id: user.tenant_id },
+      orderBy: { name: 'asc' }
+    });
+
+    let text = `🚛 **АВТОПАРК КОМПАНИИ**\n`;
+    text += `────────────────────\n`;
+    text += `🟢 — свободна, 🔴 — в рейсе\n\n`;
+
+    const buttons = trucks.map(t => [
+      { text: `${t.is_busy ? '🔴' : '🟢'} ${t.name} ${t.plate ? `[${t.plate}]` : ''}`, callback_data: `VIEW_TRK_${t.id}` }
+    ]);
+
+    buttons.push([{ text: "➕ Добавить машину", callback_data: "ADD_TRUCK" }]);
+    buttons.push([{ text: "⬅️ Назад", callback_data: "ADMIN_SETTINGS" }]);
+
+    return { message: text, buttons };
+  },
+
+  async renderSitesList(user: any) {
+    const sites = await prisma.dict_sites.findMany({
+      where: { tenant_id: user.tenant_id },
+      orderBy: { name: 'asc' }
+    });
+
+    let text = `📍 **РАБОЧИЕ ОБЪЕКТЫ**\n`;
+    text += `────────────────────\n\n`;
+
+    const buttons = sites.map(s => [
+      { text: `📍 ${s.name} ${s.odometer_required ? '📸' : ''}`, callback_data: `VIEW_STE_${s.id}` }
+    ]);
+
+    buttons.push([{ text: "➕ Добавить объект", callback_data: "ADD_SITE" }]);
+    buttons.push([{ text: "⬅️ Назад", callback_data: "ADMIN_SETTINGS" }]);
+
+    return { message: text, buttons };
+  },
+
+  async renderReportsArchive(user: any) {
+    const lastShifts = await prisma.shifts.findMany({
+      where: { tenant_id: user.tenant_id, status: 'finished' },
+      include: { user: true, truck: true },
+      take: 10,
+      orderBy: { end_time: 'desc' }
+    });
+
+    let text = `📦 **ПОСЛЕДНИЕ 10 СМЕН**\n`;
+    text += `────────────────────\n\n`;
+
+    if (lastShifts.length === 0) {
+      text += `Архив пока пуст.`;
+    } else {
+      lastShifts.forEach(s => {
+        const date = s.end_time?.toLocaleDateString('ru-RU') || '---';
+        text += `📅 ${date} | **${s.user.full_name}**\n`;
+        text += `🚛 ${s.truck?.name} | ⏱ ${s.hours_worked} ч. | 💰 ${s.salary} ₽\n\n`;
+      });
+    }
+
+    return { 
+      message: text, 
+      buttons: [[{ text: "⬅️ Назад", callback_data: "ADMIN_SETTINGS" }]] 
+    };
+  },
+
   async processText(user: any, text: string, activeShift: any) {
     const t = text.trim();
     if (t.startsWith('/start ')) return await GatewayController.handleRegistration(user, t.split(' ')[1]);
@@ -370,6 +463,10 @@ const GatewayController = {
     if (data === 'ADMIN_MAIN') return await GatewayController.renderAdminPanel(user);
     if (data === 'ADMIN_SETTINGS') return await GatewayController.renderAdminSettings(user);
     if (data === 'DRIVER_MENU') return GatewayController.renderDriverStatus(user, activeShift);
+    if (data === 'VIEW_ACTIVE') return await GatewayController.renderActiveShifts(user);
+    if (data === 'EDIT_TRUCKS') return await GatewayController.renderFleetList(user);
+    if (data === 'EDIT_SITES') return await GatewayController.renderSitesList(user);
+    if (data === 'REPORTS') return await GatewayController.renderReportsArchive(user);
     
     // Логика водителя
     if (data === 'START_SHIFT') {
@@ -402,6 +499,18 @@ const GatewayController = {
     
     // Логика админа
     if (data === 'GEN_INVITE') return await GatewayController.generateInviteLink(user);
+
+    if (data.startsWith('VIEW_TRK_')) {
+      return { message: "ℹ️ Детальная информация о машине будет доступна в WebApp.", buttons: [[{ text: "⬅️ Назад", callback_data: "EDIT_TRUCKS" }]] };
+    }
+    if (data.startsWith('VIEW_STE_')) {
+      return { message: "ℹ️ Настройки объекта (одометр, накладные) будут доступны в WebApp.", buttons: [[{ text: "⬅️ Назад", callback_data: "EDIT_SITES" }]] };
+    }
+
+    // Заглушки для действий
+    if (data === 'ADD_TRUCK' || data === 'ADD_SITE') {
+      return { message: "🏗 Для добавления новых сущностей используйте WebApp (раздел Справочники).", buttons: [[{ text: "⬅️ Назад", callback_data: "ADMIN_SETTINGS" }]] };
+    }
     
     // Заглушки для будущего функционала
     const adminStubs = ['VIEW_ACTIVE', 'VIEW_ONLINE', 'VIEW_PHOTOS', 'MANUAL_SHIFT', 'EDIT_TRUCKS', 'EDIT_SITES', 'REPORTS', 'SET_TZ', 'BILLING'];
