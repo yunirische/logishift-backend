@@ -147,28 +147,34 @@ class ShiftService {
     const user = await prisma.users.findUnique({ where: { id: userId }, include: { tenant: true } });
     if (!user) throw new Error('User not found');
     const photoUrl = await mediaService.downloadAndSave(fileId, user.tenant_id!);
+    
     return await prisma.$transaction(async (tx) => {
-      const shift = await tx.shifts.findFirst({ where: { user_id: userId, status: { not: 'finished' } }, include: { site: true }, orderBy: { id: 'desc' } });
+      const shift = await tx.shifts.findFirst({ 
+        where: { user_id: userId, status: { not: 'finished' } }, 
+        include: { site: true, truck: true }, 
+        orderBy: { id: 'desc' } 
+      });
+      
       if (!shift) throw new Error('Смена не найдена');
+
       if (user.current_state === 'awaiting_odo_start') {
         await tx.shifts.update({ where: { id: shift.id }, data: { photo_start_url: photoUrl, status: 'active', start_time: new Date() } });
         await tx.users.update({ where: { id: userId }, data: { current_state: 'active' } });
-        return { message: "✅ Одометр принят. Смена открыта!" };
-      }
-      if (user.current_state === 'awaiting_odo_end') {
+      } else if (user.current_state === 'awaiting_odo_end') {
         await tx.shifts.update({ where: { id: shift.id }, data: { photo_end_url: photoUrl } });
         if (user.tenant.invoice_required || shift.site?.invoice_required) {
           await tx.shifts.update({ where: { id: shift.id }, data: { status: 'awaiting_invoice' } });
           await tx.users.update({ where: { id: userId }, data: { current_state: 'awaiting_invoice' } });
-          return { message: "📸 Одометр принят. Теперь фото НАКЛАДНОЙ:" };
+        } else {
+          return await this.finalizeShiftInternal(tx, shift.id);
         }
-        return await this.finalizeShiftInternal(tx, shift.id);
-      }
-      if (user.current_state === 'awaiting_invoice') {
+      } else if (user.current_state === 'awaiting_invoice') {
         await tx.shifts.update({ where: { id: shift.id }, data: { photo_invoice_url: photoUrl } });
         return await this.finalizeShiftInternal(tx, shift.id);
       }
-      throw new Error('Некорректное состояние');
+      
+      // Возвращаем обновленную смену для рендеринга
+      return await tx.shifts.findUnique({ where: { id: shift.id }, include: { truck: true, site: true } });
     });
   }
 
@@ -216,7 +222,14 @@ const GatewayController = {
       } else if (type === 'text') {
         result = await GatewayController.processText(user, payload.text, activeShift);
       } else if (type === 'photo') {
-        result = await shiftService.handleShiftPhoto(user.id, payload.file_id);
+        // ОБНОВЛЕННЫЙ БЛОК:
+        const updatedData = await shiftService.handleShiftPhoto(user.id, payload.file_id);
+        // Если вернулась строка (финализация), показываем её, если объект (смена) - рендерим статус
+        if (updatedData && (updatedData as any).id) {
+            result = GatewayController.renderDriverStatus(user, updatedData);
+        } else {
+            result = updatedData; // Это сообщение о завершении смены
+        }
       }
 
       // ТЕПЕРЬ ТУТ ЧИСТО: Мы просто передаем готовое сообщение из результата
@@ -241,7 +254,8 @@ const GatewayController = {
   // --- РЕНДЕР: МЕНЮ ВОДИТЕЛЯ (Интерфейс "Конфетка") ---
   renderDriverStatus(user: any, activeShift: any) {
     const timeNow = formatInTimezone(new Date(), user.tenant?.timezone);
-    let text = `🚙 **МЕНЮ ВОДИТЕЛЯ**\n`;
+    //let text = `🚙 **МЕНЮ ВОДИТЕЛЯ**\n`;
+    let text = `✅ Фото получено!\n\n`;
     text += `🕒 ${timeNow}\n`;
     text += `────────────────────\n\n`;
 
@@ -467,6 +481,12 @@ const GatewayController = {
     if (data === 'EDIT_TRUCKS') return await GatewayController.renderFleetList(user);
     if (data === 'EDIT_SITES') return await GatewayController.renderSitesList(user);
     if (data === 'REPORTS') return await GatewayController.renderReportsArchive(user);
+    if (data === 'ADD_COMMENT') {
+      return { 
+        message: "📝 **ДОБАВЛЕНИЕ КОММЕНТАРИЯ**\n\nПросто отправьте текстовое сообщение в чат, и оно прикрепится к текущей смене.", 
+        buttons: [[{ text: "⬅️ Назад", callback_data: "DRIVER_MENU" }]] 
+      };
+    }
     
     // Логика водителя
     if (data === 'START_SHIFT') {
